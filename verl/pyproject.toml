@@ -1,0 +1,136 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verl"
+dynamic = ["version", "dependencies", "authors", "urls"]
+description = "verl: Volcano Engine Reinforcement Learning for LLM"
+license = {text = "Apache-2.0"}
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.10,<3.13"
+
+# One universal uv.lock: each backend is a PEP 621 extra; mutually exclusive ones
+# are in [tool.uv].conflicts, so a single `uv lock` resolves them all. At runtime,
+# sync one conflict-free combo into .venv (shared by every Ray worker group):
+#
+#   uv sync --extra fsdp --extra vllm     # or: python manage_envs.py sync fsdp vllm
+#
+# All backends use torch 2.13.0: vllm/sglang/fsdp/megatron/veomni on cu130, cpu on cpu
+# wheels (CI/dev). Both torch worlds coexist via [tool.uv].conflicts forks.
+# torchaudio stays at 2.11.0 — its last release, and what vllm 0.32 / sglang
+# 0.5.20 themselves pin alongside torch 2.13.
+# DEFERRED: trtllm (torch 2.10.0+cu130) — its RC sdist makes `uv lock` explode.
+# cuDNN/NCCL: torch's wheel pins them, so after `uv lock` sync CUDNN_VERSION /
+# NCCL_VERSION in docker/Dockerfile.uv.cu130 to the resolved values.
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+verl-core = [
+    "TransferQueue>=0.1.11", "pyzmq", "msgspec", "accelerate", "codetiming",
+    "datasets", "dill", "hydra-core", "numpy>=2.0.0", "pandas", "peft",
+    "pyarrow>=19.0.0", "pybind11", "pylatexenc", "transformers==5.16.1",
+    "ray[default]>=2.41.0", "torchdata", "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
+    "wandb", "packaging>=20.0", "tensorboard", "fastapi", "uvicorn",
+    "cachetools", "einops", "nvtx",
+]
+fsdp = [
+    "verl[verl-core]", "torch==2.13.0", "torchvision==0.28.0",
+    "torchaudio==2.11.0", "flash-attn==2.8.3", "liger-kernel==0.8.4",
+    "trl==0.27.0", "flash-linear-attention==0.5.2",
+]
+vllm = ["verl[verl-core]", "torch==2.13.0", "vllm==0.32.0", "transformers==5.16.1"]
+
+[tool.ruff]
+line-length = 120
+exclude = ["scripts/legacy_model_merger.py"]
+
+[tool.ruff.lint]
+isort = {known-first-party = ["verl"]}
+# c.f. https://github.com/vllm-project/vllm/blob/ce8d6b75fc0586045df75ee1568a5b5f9957251b/pyproject.toml
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # isort
+    "I",
+    "G",
+]
+ignore = [
+    # star imports
+    "F405", "F403",
+    # lambda expression assignment
+    "E731",
+    # Loop control variable not used within loop body
+    "B007",
+    # f-string format
+    "UP032",
+    # `.log()` statement uses f-string
+    "G004",
+    # X | None for type annotations
+    "UP045",
+    # deprecated import
+    "UP035",
+]
+
+[tool.mypy]
+pretty            = true
+ignore_missing_imports = true
+explicit_package_bases = true
+follow_imports = "skip"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = [
+"verl.trainer.config.algorithm",
+"verl.trainer.ppo.core_algos",
+"verl.trainer.ppo.reward",
+"verl.workers.reward_manager",
+"verl.workers.reward_manager.*",
+]
+ignore_errors = false
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {file = "verl/version/version"}
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.setuptools.package-data]
+verl = [
+  "version/*",
+  "trainer/config/*.yaml",
+  "trainer/config/*/*.yaml",
+  "experimental/*/config/*.yaml",
+]
+
+[tool.uv]
+environments = ["python_full_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'"]
+override-dependencies = ["transformers==5.16.1", "tokenizers==0.23.2", "numpy>=2.0.0", "kernels>=0.14.1,<0.15", "nvidia-cusparselt-cu13==0.8.0"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+flash-attn = { index = "verl-wheelhouse" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "verl-wheelhouse"
+url = "https://verl-project.github.io/verl-wheelhouse/cu130/torch2.13/simple/"
+explicit = true
+
+[[tool.uv.dependency-metadata]]
+name = "TransferQueue"
+requires-dist = []

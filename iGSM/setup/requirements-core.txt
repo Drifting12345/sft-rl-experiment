@@ -1,0 +1,6 @@
+numpy==1.26.4
+pandas==2.3.3
+networkx==3.4.2
+matplotlib==3.10.7
+transformers==4.51.3
+ipykernel==7.1.0

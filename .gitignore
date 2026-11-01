@@ -1,0 +1,157 @@
+# Local Conda environments and caches
+/.conda/
+/.cache/
+
+# Generated datasets and experiment outputs
+/data/**/*.jsonl
+/exp/runs/
+/exp/logs/
+
+# Keep fixed model restoration metadata; exclude model weights and temporary files
+/models/*
+!/models/README.md
+!/models/manifest.json
+!/models/restore.py
+!/models/requirements-download.txt
+
+# Python and editor generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+*.swp
+*.swo
+
+# Rules imported from the former verl/.gitignore; scoped to verl/
+/verl/**/*.pt
+/verl/**/checkpoints
+/verl/**/wget-log
+/verl/**/_build/
+/verl/**/*.ckpt
+/verl/**/outputs
+/verl/**/*.tar.gz
+/verl/**/playground
+/verl/**/wandb
+
+/verl/pyrightconfig.json
+
+# Byte-compiled / optimized / DLL files
+/verl/**/__pycache__/
+/verl/**/*.py[cod]
+/verl/**/*$py.class
+/verl/dataset/*
+/verl/tensorflow/my_graph/*
+/verl/**/.idea/
+# C extensions
+/verl/**/*.so
+
+# Distribution / packaging
+/verl/**/.Python
+# env/
+/verl/**/build/
+/verl/**/develop-eggs/
+/verl/**/dist/
+/verl/**/downloads/
+/verl/**/eggs/
+/verl/**/.eggs/
+/verl/**/lib/
+/verl/**/lib64/
+/verl/**/parts/
+/verl/**/sdist/
+/verl/**/var/
+/verl/**/tmp/
+/verl/**/*.egg-info/
+/verl/**/.installed.cfg
+/verl/**/*.egg
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+/verl/**/*.manifest
+/verl/**/*.spec
+
+# Installer logs
+/verl/**/pip-log.txt
+/verl/**/pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+/verl/**/htmlcov/
+/verl/**/.tox/
+/verl/**/.coverage
+/verl/**/.coverage.*
+/verl/**/.cache
+/verl/**/nosetests.xml
+/verl/**/coverage.xml
+/verl/**/*,cover
+/verl/**/.hypothesis/
+/verl/**/pytest.ini
+/verl/**/output.txt
+
+# Translations
+/verl/**/*.mo
+/verl/**/*.pot
+
+# Django stuff:
+/verl/**/*.log
+/verl/**/local_settings.py
+
+# Flask stuff:
+/verl/**/instance/
+/verl/**/.webassets-cache
+
+# Scrapy stuff:
+/verl/**/.scrapy
+
+# Sphinx documentation
+/verl/docs/_build/
+
+# PyBuilder
+/verl/**/target/
+
+# IPython Notebook
+/verl/**/.ipynb_checkpoints
+
+# pyenv
+/verl/**/.python-version
+
+# celery beat schedule file
+/verl/**/celerybeat-schedule
+
+# dotenv
+/verl/**/.env
+
+# virtualenv
+/verl/**/venv/
+/verl/**/.venv
+/verl/**/.venv-*
+/verl/**/.venvs/
+/verl/**/ENV/
+!/verl/**/workers/env/
+
+# Spyder project settings
+/verl/**/.spyderproject
+
+# Rope project settings
+/verl/**/.ropeproject
+
+# vscode
+/verl/**/.vscode
+
+# Mac
+/verl/**/.DS_Store
+
+# vim
+/verl/**/*.swp
+
+# emacs
+/verl/**/*~
+
+# data
+/verl/**/*.parquet
+
+
+# local logs
+/verl/**/logs
+/verl/**/log
+/verl/**/outputs
+/verl/**/.history

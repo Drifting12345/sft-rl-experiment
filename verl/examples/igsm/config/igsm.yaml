@@ -1,0 +1,100 @@
+# @package _global_
+defaults:
+  - ppo_trainer
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+data:
+  train_batch_size: 8
+  max_prompt_length: 2048
+  max_response_length: 4096
+  dataloader_num_workers: 0
+  filter_overlong_prompts: true
+  filter_overlong_prompts_workers: 1
+  truncation: error
+
+actor_rollout_ref:
+  model:
+    use_remove_padding: false
+    enable_gradient_checkpointing: true
+    override_config:
+      attn_implementation: sdpa
+  actor:
+    strategy: fsdp
+    optim:
+      lr: 1.0e-6
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size_per_gpu: 1
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    entropy_coeff: 0.0
+    fsdp_config:
+      model_dtype: bfloat16
+      param_offload: true
+      optimizer_offload: true
+      use_torch_compile: false
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+      use_torch_compile: false
+  rollout:
+    name: vllm
+    mode: async
+    n: 4
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.35
+    max_model_len: 6144
+    max_num_batched_tokens: 6144
+    max_num_seqs: 16
+    enforce_eager: true
+    log_prob_micro_batch_size_per_gpu: 1
+    agent:
+      default_agent_loop: single_turn_agent
+      num_workers: 1
+    checkpoint_engine:
+      backend: naive
+
+critic:
+  strategy: fsdp
+  ppo_micro_batch_size_per_gpu: 1
+  forward_micro_batch_size_per_gpu: 1
+  model:
+    use_remove_padding: false
+    override_config:
+      attn_implementation: sdpa
+  fsdp:
+    param_offload: true
+    optimizer_offload: true
+    use_torch_compile: false
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+reward:
+  num_workers: 1
+  reward_manager:
+    name: naive
+  reward_model:
+    enable: false
+
+distillation:
+  enabled: false
+
+trainer:
+  use_v1: true
+  v1:
+    trainer_mode: sync
+  nnodes: 1
+  n_gpus_per_node: 1
+  logger: [console]
+  project_name: igsm
+  total_epochs: 1
+  save_freq: 20
+  test_freq: 20
+  max_actor_ckpt_to_keep: 2
+  max_critic_ckpt_to_keep: 2

@@ -1,0 +1,13 @@
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch==2.13.0+cu129
+torchvision==0.28.0+cu129
+torchaudio==2.11.0+cu129
+torchcodec @ https://download.pytorch.org/whl/cu129/torchcodec-0.16.0%2Bcu129-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl#sha256=1d103c30631a2c04b2acd1602a56af7762d41051700d2077c2b6a964dbcf7f2c
+vllm @ https://github.com/vllm-project/vllm/releases/download/v0.32.0/vllm-0.32.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl#sha256=9918be806fb2808c406547ff4f9f43870ac6ff28dc4b179291fcf532145bb50b
+transformers==5.16.1
+trl==0.27.0
+TransferQueue==0.1.11
+orjson
+pytest
+-e /inspire/hdd/project/deepanalysis/guitao-25013/zfy/verl[verl-core]

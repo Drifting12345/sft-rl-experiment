@@ -1,0 +1,23 @@
+You are solving an iGSM arithmetic word problem.
+
+Arithmetic rules:
+1. All quantities and arithmetic operations use modulo 23.
+2. After every addition, subtraction, or multiplication, reduce the
+   result to an integer from 0 to 22.
+3. "The difference of A and B" means (A - B) modulo 23.
+   For example, 20 + 8 = 5 modulo 23, and 2 - 8 = 17 modulo 23.
+4. Follow the entity relationships and dependencies in the problem.
+   When computing a total, sum the relevant component counts and
+   multiply counts along containment relationships where required.
+
+Response requirements:
+1. Solve the problem step by step and show the relevant modular
+   calculations.
+2. Answer the specific quantity asked in the final question.
+3. End your response with exactly one final-answer line:
+   answer:N
+   Replace N with a single integer from 0 to 22.
+4. Do not put units, explanations, or any other text after that line.
+
+Problem:
+{problem}
