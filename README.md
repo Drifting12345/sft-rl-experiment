@@ -89,21 +89,19 @@ git push
 
 同配置生成命令见 [数据生成说明](iGSM/setup/README.md)。重新生成应使用新输出名，并保持源码、依赖、分词器和哈希种子一致；运行超时等条件也可能影响候选选择。
 
-## 评测配置与历史记录
+## 评测配置与运行状态
 
-当前仅修改配置，不启动新的评测。后续默认使用原始 Qwen3-0.6B、每次最多生成 **2048 tokens**，并关闭模型专用 thinking 模式（`--no-thinking`）；每题最多 50 次、首次答对即停止，pass@1/3/8/50 的统计口径保持不变。
+默认使用原始 Qwen3-0.6B、每次最多生成 **2048 tokens**，并关闭模型专用 thinking 模式（`--no-thinking`）；每题最多 50 次、首次答对即停止，统计 pass@1/3/8/50。
 
-旧轮 `qwen3-0.6b-igsm100-20261101T143815Z` 已停止并保留为历史记录，使用的是 8192 tokens 和 thinking 开启的配置。旧结果、日志及原脚本快照保留，不与今后 2048/no-thinking 的成绩合并。
-
-查看历史记录：
+最新一次启动的信息从运行索引读取：
 
 ```bash
 cd /inspire/hdd/project/deepanalysis/guitao-25013/zfy
 cat exp/logs/current.json
-tail -n 30 exp/logs/qwen3-0.6b-igsm100-20261101T143815Z.log
-cat exp/runs/qwen3-0.6b-igsm100-20261101T143815Z/summary.json
 ```
 
-`exp/logs/current.json` 保留旧轮索引并标记 `stopped`。中止轮的汇总只是部分结果，不能当完整 100 题评测成绩。以后手动启动新评测时使用新的结果目录；启动和恢复方法见 [实验说明](exp/README.md)。
+索引中的 `log`、`status_file`、`output_dir` 分别指向本轮日志、退出状态文件和结果目录；实际参数以该目录的 `run_config.json` 为准，进展和成绩读取 `summary.json`。具体 PID、运行时间和即时状态只记录在运行文件中，不在 README 中逐次更新。
+
+退出码为 0 且 `summary.complete=true` 表示本轮执行完成；还需结合格式错误数、截断数和原始回答解释成绩。退出状态尚未写入时，结合记录的主机、准确 PID 和日志确认是否仍在运行。`pass_at_k=null` 或未完成轮次的通过率下界不能当最终成绩。不同提示词、输出长度或 thinking 配置使用独立结果目录，不合并成绩。启动、查看和恢复方法见 [实验说明](exp/README.md)。
 
 本工作区保留后续实验所需源码、环境配方、模型恢复工具、数据和实验结果；历史安装排错脚本、旧验证日志与 smoke checkpoint 已清理。此前完成过单 GPU 的 GRPO/PPO 各一步运行验收，这不代表训练收敛或多卡验证。环境迁移仍需核对平台、驱动和路径，不能仅凭包清单保证完全复现。

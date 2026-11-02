@@ -5,7 +5,7 @@
 | 路径 | 用途 |
 | --- | --- |
 | `eval_qwen3_igsm.py` | 采样、最终答案判分、提前停止和续跑 |
-| `prompt.txt` | 已确认的模 23 提示词，末行要求 `answer:N` |
+| `prompt.txt` | 模 23 规则；题目后要求简短计算和带实际整数的最终答案 |
 | `run_eval.sh` | 接受 `RUN_NAME` 和后续 CLI 参数，激活环境并记录最终退出码 |
 | `logs/` | 日志、wrapper PID 索引和最终退出状态 |
 | `runs/` | 每次评测的配置、实际输入、逐次回答和汇总 |
@@ -14,27 +14,52 @@
 
 每题最多采样 50 次，每轮每道尚未答对的题只生成一次，首次正确后停止该题。记首次正确次数为 r，`pass@k = count(r <= k) / 100`，k 为 1、3、8、50；50 次均错则各项均失败。每次回答只包含相同原始题面和提示词，不带参考解答、答案或历史纠错反馈。
 
-最终回答区必须以唯一的 `answer:N` 行结束，N 为 0–22 的整数；只比较最终数字，推理内容不参与判分，也不会对越界答案再取模。重复答案、未闭合思考、缺少最终答案、长度截断等记错。保留完整生成原文和解析原因。
+最终回答区末行由小写前缀 `answer:` 紧接实际的 0–22 整数组成；只比较最终数字，推理内容不参与判分，也不会对越界答案再取模。字母占位符、重复答案、未闭合思考、缺少最终答案、长度截断等记错。保留完整生成原文和解析原因。
+
+提示词先给模运算规则和完整题目，再要求简短的可见计算与最终数字，不提供可照抄的字母占位符或固定答案示例。关闭模型专用 thinking 模式不会禁止输出可见解答。修改提示词后先检查少量真实输出，再用新目录进行完整评测；不同提示词的结果不合并。
 
 默认参数为 **thinking 关闭**（`--no-thinking`）、temperature 0.6、top_p 0.95、top_k 20、seed 42；每次最多生成 **2048 tokens**，上下文上限 16384，batch 8、单 GPU、BF16、vLLM eager、GPU memory utilization 0.80。关闭专用 thinking 模式后，提示词仍要求逐步展示模运算。按实际 Qwen tokenizer 检查输入长度，不将数据集的 GPT-2 token 统计当作 Qwen 长度。
 
-## 当前状态与历史轮
+## 查看运行状态
 
-当前仅修改默认参数，没有启动新评测。旧轮 `qwen3-0.6b-igsm100-20261101T143815Z` 已停止，以下文件保留为历史记录：
-
-- 历史任务索引：`logs/current.json`，状态标记为 `stopped`。
-- 日志：`logs/qwen3-0.6b-igsm100-20261101T143815Z.log`。
-- 最终退出码：`logs/qwen3-0.6b-igsm100-20261101T143815Z.status`。
-- 结果：`runs/qwen3-0.6b-igsm100-20261101T143815Z/`。
+`logs/current.json` 索引最近一次启动的任务，保存名称、主机、PID、日志路径 `log`、退出状态文件 `status_file` 和结果目录 `output_dir`。每次启动更新索引，无需为具体运行修改 README。
 
 ```bash
 cd /inspire/hdd/project/deepanalysis/guitao-25013/zfy/exp
-cat logs/current.json
-tail -n 30 logs/qwen3-0.6b-igsm100-20261101T143815Z.log
-cat runs/qwen3-0.6b-igsm100-20261101T143815Z/summary.json
+python -B - <<'PY'
+from pathlib import Path
+import json
+import subprocess
+
+info = json.loads(Path("logs/current.json").read_text())
+print(json.dumps(info, ensure_ascii=False, indent=2))
+status = Path(info["status_file"])
+print("exit_status:", status.read_text().strip() if status.is_file() else "未写入")
+output = Path(info["output_dir"])
+config_path = output / "run_config.json"
+if config_path.is_file():
+    config = json.loads(config_path.read_text())
+    keys = ["max_tokens", "thinking", "max_attempts", "pass_k", "batch_size"]
+    print("config:", json.dumps({key: config.get(key) for key in keys}, ensure_ascii=False))
+summary_path = output / "summary.json"
+if summary_path.is_file():
+    summary = json.loads(summary_path.read_text())
+    keys = ["complete", "num_questions", "solved", "total_attempts", "pass_at_k",
+            "current_pass_at_k_lower_bound"]
+    print("summary:", json.dumps({key: summary.get(key) for key in keys}, ensure_ascii=False))
+if Path(info["log"]).is_file():
+    subprocess.run(["tail", "-n", "30", info["log"]], check=True)
+PY
 ```
 
-旧轮使用 8192 tokens、thinking 开启，原脚本快照和原结果保留。其未完成汇总中的 `pass_at_k` 为 null，`current_pass_at_k_lower_bound` 只是部分结果。后续 2048/no-thinking 评测从新目录开始，不能合并两种配置的成绩；恢复旧轮需原脚本快照及原参数，不能直接使用已修改的默认脚本续跑。
+- `.status` 中的退出码为 0 且 `summary.complete=true`，表示本轮完整评测成功结束。
+- 非零退出码需结合停止原因和日志，区分人为中止与执行失败；不能当作完整成绩。
+- 退出状态文件尚不存在时，还需在记录的同一主机上核对准确 PID、命令行和日志，不能仅据文件缺失认定运行中。
+- `pass_at_k=null` 表示尚未完成；`current_pass_at_k_lower_bound` 只是当前通过率下界。
+
+正常退出仅表示执行完成；同时查看 `invalid_answer_attempts`、`truncated_attempts` 与原始回答，区分格式失败、截断和最终数字算错。
+
+每轮独立保存实际配置、结果及必要的源代码快照。不同 token 上限或 thinking 设置不合并成绩；恢复旧轮需该轮的原脚本和原参数，不能直接套用已改变的默认值。
 
 ## 启动与恢复
 
@@ -46,7 +71,7 @@ cd /inspire/hdd/project/deepanalysis/guitao-25013/zfy/exp
 python -B eval_qwen3_igsm.py --max-tokens 2048 --no-thinking --dry-run
 ```
 
-以下为以后手动启动新实验的示例，本次不执行。使用新的 `RUN_NAME`：
+新评测使用新的 `RUN_NAME`：
 
 ```bash
 cd /inspire/hdd/project/deepanalysis/guitao-25013/zfy
