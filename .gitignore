@@ -8,6 +8,8 @@
 /exp/logs/
 /exp/sft/runs/
 /exp/sft/logs/
+/exp/rl/runs/
+/exp/rl/logs/
 
 # Keep fixed model restoration metadata; exclude model weights and temporary files
 /models/*

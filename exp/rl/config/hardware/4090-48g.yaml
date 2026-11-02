@@ -1,0 +1,10 @@
+# @package _global_
+# Single node with eight 48 GB RTX 4090 GPUs; batch sizes stay in base.yaml.
+actor_rollout_ref:
+  actor:
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: false
+  rollout:
+    gpu_memory_utilization: 0.45
+    max_num_seqs: 32

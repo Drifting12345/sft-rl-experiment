@@ -1,0 +1,21 @@
+# @package _global_
+# Binary-outcome DAPO: Clip-Higher + group filtering + token-level loss.
+# No soft overlong reward shaping: unfinished responses receive the binary score 0.
+# The actual refill/time limits are enforced by BoundedSamplingMixin.
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  filter_groups:
+    enable: true
+    metric: reward
+    max_num_gen_batches: 0
+    max_inflight_gen_batches: 1
+
+actor_rollout_ref:
+  actor:
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    loss_agg_mode: token-mean
+
+igsm_rl:
+  algorithm: dapo

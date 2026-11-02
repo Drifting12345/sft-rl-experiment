@@ -1,0 +1,10 @@
+# @package _global_
+# Single node with eight 24 GB RTX 3090 GPUs; same algorithm and batch sizes.
+actor_rollout_ref:
+  actor:
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+  rollout:
+    gpu_memory_utilization: 0.30
+    max_num_seqs: 16
