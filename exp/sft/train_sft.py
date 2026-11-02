@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-GPU, full-parameter SFT of Qwen3 on verified iGSM worked solutions."""
+"""Single-GPU Qwen3 LoRA SFT with a held-out split and validation-loss early stopping."""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,7 @@ from importlib.metadata import version
 import json
 import os
 from pathlib import Path
+import random
 import re
 import shutil
 import sys
@@ -61,6 +62,34 @@ def reject_overlap(left: list[dict], right: list[dict], description: str) -> Non
                   or ("seed" in row and row["seed"] in seeds)]
     if collisions:
         raise ValueError(f"{description}: overlapping questions or generator seeds: {collisions[:5]}")
+
+
+def split_records(rows: list[dict], seed: int) -> tuple[list[dict], list[dict], dict]:
+    """Keep the same generator seed in one partition, targeting 90/10 by row count."""
+    groups = {}
+    for index, row in enumerate(rows):
+        key = f"seed:{row['seed']}" if "seed" in row else f"problem:{row['_problem_key']}"
+        groups.setdefault(key, []).append(index)
+    if len(groups) < 10:
+        raise ValueError("Automatic 90/10 splitting requires at least 10 independent question/seed groups")
+    keys = sorted(groups)
+    random.Random(seed).shuffle(keys)
+    cumulative = [0]
+    for key in keys:
+        cumulative.append(cumulative[-1] + len(groups[key]))
+    boundary = min(range(1, len(keys)), key=lambda n: (abs(cumulative[n] - len(rows) * 0.1), cumulative[n]))
+    validation_indices = {index for key in keys[:boundary] for index in groups[key]}
+    train = [row for index, row in enumerate(rows) if index not in validation_indices]
+    validation = [row for index, row in enumerate(rows) if index in validation_indices]
+    reject_overlap(train, validation, "Automatic train/validation split")
+    manifest = {"seed": seed, "requested_validation_fraction": 0.1,
+        "actual_validation_fraction": len(validation) / len(rows), "independent_groups": len(groups),
+        "train": [], "validation": []}
+    for index, row in enumerate(rows):
+        manifest["validation" if index in validation_indices else "train"].append({
+            "source_index": index, "id": row["id"], "problem_sha256": row["_problem_key"],
+            "generator_seed": row.get("seed")})
+    return train, validation, manifest
 
 
 def target_text(row: dict) -> str:
@@ -128,8 +157,7 @@ class CompletionCollator:
 
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--train-data", type=Path, required=True, help="Separate iGSM JSONL with problem/solution/answer")
-    parser.add_argument("--eval-data", type=Path, help="Optional independent SFT validation JSONL (loss only)")
+    parser.add_argument("--train-data", type=Path, required=True, help="New iGSM JSONL pool, automatically split 90/10")
     parser.add_argument("--heldout-data", type=Path, nargs="+", default=[ROOT / "data" / DATA_NAME],
                         help="Protected test sets checked for train/validation question and seed overlap")
     parser.add_argument("--model", type=Path, default=ROOT / "models/Qwen3-0.6B")
@@ -140,10 +168,16 @@ def arguments():
     parser.add_argument("--resume-from-checkpoint", type=Path)
     parser.add_argument("--max-length", type=int, default=8192)
     parser.add_argument("--max-response-tokens", type=int, default=2048)
-    parser.add_argument("--epochs", type=float, default=3)
-    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--epochs", type=float, default=10)
+    parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--lora-target-modules", nargs="+",
+                        default=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+    parser.add_argument("--early-stopping-patience", type=int, default=2, help="Consecutive validation-loss increases; ties reset the counter")
     parser.add_argument("--max-steps", type=int, default=-1, help="Positive value overrides epochs")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry-run", action="store_true", help="Validate/tokenize on CPU; do not load model weights or train")
@@ -154,6 +188,10 @@ def arguments():
         parser.error("epochs, learning-rate and batch sizes must be positive")
     if args.max_steps == 0 or args.max_steps < -1:
         parser.error("max-steps must be -1 or positive")
+    if min(args.lora_r, args.lora_alpha, args.early_stopping_patience) < 1:
+        parser.error("LoRA rank/alpha and early-stopping patience must be positive")
+    if not 0 <= args.lora_dropout < 1:
+        parser.error("lora-dropout must be in [0, 1)")
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         parser.error("This entry point supports one GPU; do not launch it with torchrun")
     return args
@@ -163,16 +201,14 @@ def main():
     args = arguments()
     os.environ.update(HF_HUB_OFFLINE="1", HF_HUB_DISABLE_IMPLICIT_TOKEN="1",
                       TOKENIZERS_PARALLELISM="false", PYTHONDONTWRITEBYTECODE="1")
-    train_rows, train_sha = read_records(args.train_data, solutions=True)
-    validation, validation_sha = read_records(args.eval_data, solutions=True) if args.eval_data else ([], None)
-    if validation:
-        reject_overlap(train_rows, validation, "Training vs SFT validation")
+    pool, train_sha = read_records(args.train_data, solutions=True)
     heldout_info = []
     for path in args.heldout_data:
         protected, sha = read_records(path, solutions=False)
-        reject_overlap(train_rows, protected, f"Training vs held-out {path}")
-        reject_overlap(validation, protected, f"SFT validation vs held-out {path}")
+        reject_overlap(pool, protected, f"SFT data pool vs held-out {path}")
         heldout_info.append({"path": str(path.resolve()), "sha256": sha, "count": len(protected)})
+    train_rows, validation, split_manifest = split_records(pool, args.seed)
+    split_sha = digest(json.dumps(split_manifest, sort_keys=True, separators=(",", ":")).encode())
     template = args.prompt.read_text(encoding="utf-8")
     example_path = None if args.no_examples else args.examples
     examples, examples_sha, examples_raw = read_examples(example_path)
@@ -193,11 +229,12 @@ def main():
         datasets[name] = [pair[0] for pair in pairs]
         lengths[name] = [pair[1] for pair in pairs]
     config = {
-        "schema_version": 1, "method": "full_parameter_sft", "thinking": False,
+        "schema_version": 2, "method": "lora_sft", "thinking": False,
         "loss": "target assistant solution + final numeric answer + EOS; prefix/examples/padding masked",
         "train_data": str(args.train_data.resolve()), "train_sha256": train_sha,
-        "eval_data": str(args.eval_data.resolve()) if args.eval_data else None,
-        "eval_sha256": validation_sha, "protected_heldout": heldout_info,
+        "split_manifest_sha256": split_sha, "split_seed": args.seed,
+        "validation_fraction": 0.1, "actual_validation_fraction": len(validation) / len(pool),
+        "train_count": len(train_rows), "validation_count": len(validation), "protected_heldout": heldout_info,
         "model": str(args.model.resolve()), "model_config_sha256": digest((args.model / "config.json").read_bytes()),
         "tokenizer_config_sha256": digest((args.model / "tokenizer_config.json").read_bytes()),
         "tokenizer_files_sha256": {name: digest((args.model / name).read_bytes())
@@ -207,11 +244,17 @@ def main():
         "examples": str(example_path.resolve()) if example_path else None, "examples_sha256": examples_sha,
         "script_sha256": digest(Path(__file__).read_bytes()),
         "evaluation_helpers_sha256": digest((EXP / "eval_qwen3_igsm.py").read_bytes()),
-        "versions": {name: version(name) for name in ["transformers", "torch", "accelerate"]},
+        "early_stopping_sha256": digest(Path(__file__).with_name("early_stopping.py").read_bytes()),
+        "versions": {name: version(name) for name in ["transformers", "torch", "accelerate", "peft", "tokenizers"]},
         "hyperparameters": {name: getattr(args, name) for name in ["max_length", "max_response_tokens", "epochs",
             "learning_rate", "micro_batch_size", "gradient_accumulation_steps", "max_steps", "seed"]},
         "optimizer": "adamw_torch", "weight_decay": 0.01, "warmup_ratio": 0.03,
         "lr_scheduler": "cosine", "dtype": "bfloat16", "attention": "sdpa", "gradient_checkpointing": True,
+        "lora": {"rank": args.lora_r, "alpha": args.lora_alpha, "dropout": args.lora_dropout,
+                 "target_modules": args.lora_target_modules, "bias": "none"},
+        "early_stopping": {"metric": "eval_loss", "greater_is_better": False,
+                           "patience": args.early_stopping_patience, "comparison": "previous_epoch",
+                           "rule": "strict loss increase increments; tie or decrease resets", "frequency": "epoch"},
     }
     print(json.dumps({"config": config, "lengths": {name: {
         "count": len(items), "max_total_tokens": max((x["total_tokens"] for x in items), default=0),
@@ -223,8 +266,12 @@ def main():
 
     import torch
     from transformers import AutoModelForCausalLM, Trainer, TrainingArguments, set_seed
+    from peft import LoraConfig, TaskType, get_peft_model
+    from early_stopping import ConsecutiveWorseningCallback
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError("This BF16 recipe requires a CUDA GPU with BF16 support")
+    if torch.cuda.device_count() != 1:
+        raise RuntimeError("Select exactly one GPU with CUDA_VISIBLE_DEVICES for this training entry point")
     output = args.output_dir.resolve()
     checkpoint = args.resume_from_checkpoint.resolve() if args.resume_from_checkpoint else None
     if checkpoint:
@@ -232,6 +279,8 @@ def main():
             raise ValueError("Resume checkpoint must be a checkpoint-N directly inside output-dir")
         if json.loads((output / "sft_config.json").read_text()) != config:
             raise ValueError("Resume inputs/settings/source differ from the original run")
+        if json.loads((output / "split_manifest.json").read_text()) != split_manifest:
+            raise ValueError("Resume split differs from the saved partition")
         for name in ["trainer_state.json", "optimizer.pt", "scheduler.pt", "rng_state.pth"]:
             if not (checkpoint / name).is_file():
                 raise ValueError(f"Resume checkpoint is missing {name}; model-only export cannot resume training")
@@ -242,37 +291,59 @@ def main():
         if not checkpoint:
             atomic_json(output / "sft_config.json", config)
             atomic_json(output / "token_lengths.json", lengths)
+            atomic_json(output / "split_manifest.json", split_manifest)
             (output / "prompt.txt").write_text(template, encoding="utf-8")
             if examples_raw is not None:
                 (output / "examples.json").write_bytes(examples_raw)
             shutil.copyfile(__file__, output / "train_sft.py")
             shutil.copyfile(EXP / "eval_qwen3_igsm.py", output / "evaluation_helpers.py")
+            shutil.copyfile(Path(__file__).with_name("early_stopping.py"), output / "early_stopping.py")
         set_seed(args.seed)
         model = AutoModelForCausalLM.from_pretrained(args.model.resolve(), local_files_only=True,
             trust_remote_code=False, dtype=torch.bfloat16, attn_implementation="sdpa")
         model.config.use_cache = False
+        model = get_peft_model(model, LoraConfig(task_type=TaskType.CAUSAL_LM, r=args.lora_r,
+            lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+            target_modules=args.lora_target_modules, bias="none"))
+        model.enable_input_require_grads()
+        model.print_trainable_parameters()
         training_args = TrainingArguments(output_dir=str(output), num_train_epochs=args.epochs,
             max_steps=args.max_steps, learning_rate=args.learning_rate, weight_decay=0.01,
             warmup_steps=0.03, lr_scheduler_type="cosine", optim="adamw_torch",
             per_device_train_batch_size=args.micro_batch_size, per_device_eval_batch_size=1,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
-            bf16=True, tf32=True, eval_strategy="epoch" if validation else "no", save_strategy="epoch",
+            bf16=True, tf32=True, eval_strategy="epoch", save_strategy="epoch",
+            load_best_model_at_end=True, metric_for_best_model="eval_loss", greater_is_better=False,
+            restore_callback_states_from_checkpoint=True,
             save_total_limit=2, save_only_model=False, logging_steps=10,
             report_to="none", prediction_loss_only=True, remove_unused_columns=False,
             dataloader_num_workers=0, seed=args.seed, data_seed=args.seed)
         trainer = Trainer(model=model, args=training_args, train_dataset=datasets["train"],
             eval_dataset=datasets["validation"] if validation else None,
-            processing_class=tokenizer, data_collator=CompletionCollator(tokenizer.pad_token_id))
+            processing_class=tokenizer, data_collator=CompletionCollator(tokenizer.pad_token_id),
+            callbacks=[ConsecutiveWorseningCallback(patience=args.early_stopping_patience)])
         result = trainer.train(resume_from_checkpoint=str(checkpoint) if checkpoint else None)
         trainer.save_state()
         trainer.save_metrics("train", result.metrics)
-        model.config.use_cache = True
+        trained = trainer.accelerator.unwrap_model(trainer.model)
+        adapter = output / "best_adapter"
+        trained.save_pretrained(adapter, safe_serialization=True)
+        tokenizer.save_pretrained(adapter)
+        merged = trained.merge_and_unload(safe_merge=True)
+        merged.config.use_cache = True
         final = output / "final"
-        trainer.save_model(str(final))
+        if (final / "adapter_config.json").exists():
+            raise ValueError("final/ must contain only a merged model, not a PEFT adapter")
+        merged.save_pretrained(final, safe_serialization=True)
         tokenizer.save_pretrained(final)
+        stopping = next(callback for callback in trainer.callback_handler.callbacks if isinstance(callback, ConsecutiveWorseningCallback))
         atomic_json(output / "result.json", {"complete": True, "global_step": trainer.state.global_step,
-                    "final_model": str(final), "metrics": result.metrics})
+                    "best_checkpoint": trainer.state.best_model_checkpoint,
+                    "best_validation_loss": trainer.state.best_metric, "epoch": trainer.state.epoch,
+                    "early_stopping_counter": stopping.consecutive_increases,
+                    "early_stopped": stopping.consecutive_increases >= args.early_stopping_patience,
+                    "adapter": str(adapter), "final_model": str(final), "metrics": result.metrics})
         print(f"SFT_COMPLETE: {final}", flush=True)
 
 
