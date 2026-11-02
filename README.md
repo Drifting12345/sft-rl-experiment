@@ -93,6 +93,10 @@ git push
 
 默认使用原始 Qwen3-0.6B、每次最多生成 **2048 tokens**，并关闭模型专用 thinking 模式（`--no-thinking`）；每题最多 50 次、首次答对即停止，统计 pass@1/3/8/50。
 
+`exp/prompt.txt` 使用简短主指令：全部计算按模 23 进行、使用简洁等式推导，末行用小写 `answer:` 紧接实际整数，随后附上当前题面。可选的 `--examples PATH` 在当前题目前加入固定的 user/assistant 示范；不传时仍只发送当前题目的单条 user 消息。
+
+`exp/prompt_examples.json` 包含两对人工 toy 计算：`4 * 6 mod 23 = 1` 和 `18 + 10 mod 23 = 5`。带示例运行时显式传入 `--examples prompt_examples.json`（从 `exp` 目录解析），所有题和尝试复用同两对示例，不提供正式 100 题的参考答案或历史纠错反馈。选用示例的每轮保存示例快照及 SHA256，完整输入消息和 token IDs 记录在 `prompts.jsonl`；few-shot 轮与旧单 user 提示的结果分开统计。
+
 最新一次启动的信息从运行索引读取：
 
 ```bash

@@ -1,0 +1,18 @@
+[
+  {
+    "role": "user",
+    "content": "Compute 4 * 6 modulo 23. Show a brief calculation and put the final result after the lowercase prefix answer: on the last line."
+  },
+  {
+    "role": "assistant",
+    "content": "4 * 6 = 24. The remainder of 24 divided by 23 is 1.\nanswer:1"
+  },
+  {
+    "role": "user",
+    "content": "Compute 18 + 10 modulo 23. Show a brief calculation and put the final result after the lowercase prefix answer: on the last line."
+  },
+  {
+    "role": "assistant",
+    "content": "18 + 10 = 28. The remainder of 28 divided by 23 is 5.\nanswer:5"
+  }
+]

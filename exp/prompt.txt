@@ -1,24 +1,3 @@
-Solve the arithmetic word problem below.
+All arithmetic is modulo 23. Solve the following problem using concise equations. Put the final numeric result after the lowercase prefix answer: on the last line.
 
-All quantities and arithmetic operations use modulo 23. After every
-addition, subtraction, or multiplication, take the nonnegative remainder
-modulo 23, so each computed quantity is an integer from 0 to 22.
-"The difference of A and B" means subtract B from A and then reduce modulo 23.
-Follow the stated entity relationships and dependencies. For totals, sum
-the relevant component counts and multiply counts along containment
-relationships when necessary.
-
-Problem:
 {problem}
-
-Write your response in this order:
-1. First give a concise worked solution with the relevant equations and
-   modular calculations. Do not repeat the entire question.
-2. Then give the final result on the last line. Start that line with the
-   lowercase prefix answer: and immediately follow it with the actual
-   integer you computed, written in decimal digits from 0 to 22.
-
-Use an actual number for the final result, never a letter, variable name,
-placeholder, or description of the output format. Give one final answer,
-with no units or explanation after the number.
-Begin with your worked solution.
