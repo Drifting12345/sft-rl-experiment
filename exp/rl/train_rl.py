@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch single-node verl GRPO/DAPO from an original Qwen base model."""
+"""Launch single-node LoRA GRPO/DAPO from an original Qwen base model."""
 from __future__ import annotations
 
 import argparse
@@ -28,12 +28,17 @@ def arguments():
     parser.add_argument("--heldout-data", type=Path, nargs="+", default=[ROOT / "data" / DATA_NAME])
     parser.add_argument("--gpus", type=int, default=8, help="Single-node GPU count; use 1 only for a separate debug run")
     parser.add_argument("--rollout-tp", type=int, default=1)
+    parser.add_argument("--rollout-execution", choices=["eager", "cudagraph"], default="eager",
+        help="vLLM execution mode; CUDA Graph changes execution only, not sampling or DAPO settings")
     parser.add_argument("--train-batch-size", type=int, default=32, help="Prompt groups per update")
     parser.add_argument("--mini-batch-size", type=int, default=8, help="Prompt groups; verl multiplies this by rollout n")
     parser.add_argument("--samples-per-prompt", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epoch-unit", choices=["nominal", "data-pass"], default="nominal",
+        help="data-pass: one question group per iteration; filtered groups count toward actual dataset passes")
     parser.add_argument("--max-steps", type=int, help="Optional explicit optimization-step limit")
     parser.add_argument("--validate-every", type=int, help="Defaults to one nominal epoch")
+    parser.add_argument("--save-every", type=int, help="Checkpoint interval; defaults to validation interval")
     parser.add_argument("--max-prompt-length", type=int, default=4096)
     parser.add_argument("--max-response-length", type=int, default=2048)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
@@ -53,6 +58,8 @@ def arguments():
         parser.error("max-steps must be positive")
     if args.validate_every is not None and args.validate_every < 1:
         parser.error("validate-every must be positive")
+    if args.save_every is not None and args.save_every < 1:
+        parser.error("save-every must be positive")
     if args.gpus % args.rollout_tp or args.train_batch_size % args.mini_batch_size:
         parser.error("gpus must divide into rollout TP groups, and train batch must divide into mini-batches")
     if args.mini_batch_size * args.samples_per_prompt % args.gpus:
@@ -80,6 +87,11 @@ def build_config(args, data: dict):
         raise ValueError("The training partition is smaller than train-batch-size; provide more data or lower the batch")
     steps_per_epoch = data["train_count"] // args.train_batch_size
     frequency = args.validate_every or steps_per_epoch
+    if args.epoch_unit == "data-pass":
+        if args.algorithm != "dapo" or args.train_batch_size != 1 or args.mini_batch_size != 1 or args.samples_per_prompt != 8:
+            raise ValueError("data-pass mode requires DAPO, one group per batch/update, and eight responses")
+        if args.max_steps is not None or (args.validate_every is not None and args.validate_every != data["train_count"]):
+            raise ValueError("data-pass mode uses epoch budget and validates after every complete training-pool pass")
     model = original_model(args.model)
     config = json.loads((model / "config.json").read_text())
     if config["num_attention_heads"] % args.rollout_tp:
@@ -103,7 +115,7 @@ def build_config(args, data: dict):
         "reward.custom_reward_function.path": str(HERE / "reward.py"),
         "trainer.nnodes": 1, "trainer.n_gpus_per_node": args.gpus,
         "trainer.total_epochs": args.epochs, "trainer.total_training_steps": args.max_steps,
-        "trainer.test_freq": frequency, "trainer.save_freq": frequency,
+        "trainer.test_freq": frequency, "trainer.save_freq": getattr(args, "save_every", None) or frequency,
         "trainer.default_local_dir": str(output / "checkpoints"),
         "trainer.experiment_name": f"igsm-{args.algorithm}-{args.hardware}",
         "trainer.resume_mode": "resume_path" if args.resume else "disable",
@@ -115,6 +127,17 @@ def build_config(args, data: dict):
     }
     for name, value in updates.items():
         OmegaConf.update(cfg, name, value, merge=False)
+    if args.epoch_unit == "data-pass":
+        OmegaConf.update(cfg, "igsm_rl.epoch_unit", "data-pass", force_add=True)
+        cfg.data.gen_batch_size = 1
+        cfg.trainer.total_training_steps = data["train_count"] * args.epochs
+    if getattr(args, "rollout_execution", "eager") == "cudagraph":
+        cfg.actor_rollout_ref.rollout.enforce_eager = False
+        cfg.actor_rollout_ref.rollout.cudagraph_capture_sizes = [
+            size for size in [1, 2, 4, 8, 16, 32, 64]
+            if size <= cfg.actor_rollout_ref.rollout.max_num_seqs]
+        OmegaConf.update(cfg, "actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config",
+                         {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}, merge=False, force_add=True)
     cfg.actor_rollout_ref.rollout.max_num_batched_tokens = max(
         cfg.actor_rollout_ref.rollout.max_num_batched_tokens, args.max_prompt_length + args.max_response_length)
     cfg.ray_kwargs.ray_init.runtime_env = OmegaConf.create({"py_executable": sys.executable,
@@ -122,6 +145,13 @@ def build_config(args, data: dict):
                      "HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1",
                      "PYTHONDONTWRITEBYTECODE": "1", "TOKENIZERS_PARALLELISM": "false"}})
     OmegaConf.resolve(cfg)
+    adapter = cfg.actor_rollout_ref.model
+    if adapter.lora_rank <= 0 or adapter.lora_alpha <= 0:
+        raise ValueError("RL requires a positive LoRA rank and alpha")
+    if adapter.lora.rank != adapter.lora_rank or adapter.lora.alpha != adapter.lora_alpha:
+        raise ValueError("Actor and rollout LoRA rank/alpha settings disagree")
+    if not 0.0 <= adapter.lora.dropout < 1.0:
+        raise ValueError("LoRA dropout must be in [0, 1)")
     return cfg
 
 
@@ -159,13 +189,34 @@ def main():
     resume_independent_cfg = json.loads(json.dumps(cfg_dict))
     resume_independent_cfg["trainer"]["resume_mode"] = "disable"
     resume_independent_cfg["trainer"]["resume_from_path"] = None
-    manifest = {"schema_version": 1, "algorithm": args.algorithm, "hardware": args.hardware,
+    framework_files = [
+        "verl/verl/workers/engine/fsdp/transformer_impl.py",
+        "verl/verl/utils/fsdp_utils.py",
+        "verl/verl/utils/checkpoint/fsdp_checkpoint_manager.py",
+        "verl/verl/model_merger/base_model_merger.py",
+    ]
+    framework_sources = {name: digest((ROOT / name).read_bytes()) for name in framework_files}
+    adapter = cfg.actor_rollout_ref.model
+    lora_settings = {"rank": adapter.lora_rank, "alpha": adapter.lora_alpha,
+                     "dropout": adapter.lora.dropout, "parameter_dtype": "float32",
+                     "optimizer_state_dtype": "float32", "bias": "none",
+                     "target_modules": list(adapter.target_modules)}
+    manifest = {"schema_version": 2, "algorithm": args.algorithm, "hardware": args.hardware,
+        "finetuning": "lora", "lora": lora_settings,
+        "epoch_unit": args.epoch_unit,
+        "checkpoint_unit": "candidate_groups_seen" if args.epoch_unit == "data-pass" else "global_training_steps",
+        "model_selection": {"metric": "validation mean binary accuracy", "mode": "max",
+                            "tie_break": "latest", "early_stop": "two consecutive strict declines"},
+        "framework_lora_sources_sha256": framework_sources,
         "original_model": str(model), "dataset": data, "sources_sha256": sources,
         "configuration": resume_independent_cfg,
-        "versions": {name: version(name) for name in ["torch", "transformers", "vllm", "ray", "hydra-core"]}}
+        "versions": {name: version(name) for name in ["torch", "transformers", "peft", "vllm", "ray", "hydra-core"]}}
     print(json.dumps({"algorithm": args.algorithm, "hardware": args.hardware,
         "gpus": args.gpus, "rollout_replicas": args.gpus // args.rollout_tp,
         "train_count": data["train_count"], "validation_count": data["validation_count"],
+        "finetuning": "lora", "lora": lora_settings,
+        "samples_per_prompt": args.samples_per_prompt,
+        "responses_per_update": args.train_batch_size * args.samples_per_prompt,
         "reward": "strict binary final-answer accuracy", "thinking": False,
         "validation_interval": cfg.trainer.test_freq, "config": cfg_dict}, indent=2), flush=True)
     if args.dry_run:
@@ -197,6 +248,10 @@ def main():
                 target = output / "source" / path.relative_to(HERE)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(path, target)
+            for name in framework_sources:
+                target = output / "source" / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / name, target)
         from verl.trainer.main_ppo import run_ppo
         from task_runner import RLTaskRunner
         import ray

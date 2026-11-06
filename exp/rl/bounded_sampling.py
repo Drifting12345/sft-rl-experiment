@@ -18,20 +18,41 @@ class BoundedReplayBuffer(ReplayBuffer):
     Checks surround backend calls; they do not interrupt a blocked backend RPC.
     """
 
-    def __init__(self, *, deadline_check, **kwargs):
+    def __init__(self, *, deadline_check, remaining_prompt_budget, **kwargs):
         self._deadline_check = deadline_check
+        self._remaining_prompt_budget = remaining_prompt_budget
+        self._original_refill = kwargs["refill_fn"]
+        kwargs["refill_fn"] = self._refill_within_budget
         self._bounded_partition = None
+        self._bounded_global_steps = None
+        self._bounded_batch_size = None
         super().__init__(**kwargs)
 
+    def _refill_within_budget(self, requested):
+        if self._bounded_partition == "val":
+            return self._original_refill(requested)
+        self._deadline_check()
+        remaining = self._remaining_prompt_budget()
+        if remaining == 0:
+            # The upstream loop refreshes metadata after a refill call. Wait
+            # for outstanding generations instead of fetching more data or
+            # spinning while the budget is exhausted.
+            time.sleep(self.poll_interval)
+            self._deadline_check()
+            return 0
+        return self._original_refill(min(requested, remaining))
+
     def sample(self, global_steps, partition_id, batch_size):
-        previous = self._bounded_partition
+        previous = (self._bounded_partition, self._bounded_global_steps, self._bounded_batch_size)
         self._bounded_partition = partition_id
+        self._bounded_global_steps = global_steps
+        self._bounded_batch_size = batch_size
         try:
             if partition_id != "val":
                 self._deadline_check()
             return super().sample(global_steps, partition_id, batch_size)
         finally:
-            self._bounded_partition = previous
+            self._bounded_partition, self._bounded_global_steps, self._bounded_batch_size = previous
 
     def _sync_metadata_from_transfer_queue(self):
         bounded = self._bounded_partition is not None and self._bounded_partition != "val"
@@ -40,6 +61,18 @@ class BoundedReplayBuffer(ReplayBuffer):
         result = super()._sync_metadata_from_transfer_queue()
         if bounded:
             self._deadline_check()
+            partition = self._bounded_partition
+            inflight = len(self.pending_keys[partition]) + len(self.running_keys[partition])
+            if self._remaining_prompt_budget() == 0 and inflight == 0:
+                reasons = self._terminal_eviction_reasons(self._bounded_global_steps, partition)
+                available = len(self._sampleable_terminal_keys(partition, reasons))
+                if available < self._bounded_batch_size:
+                    raise RuntimeError(
+                        f"DAPO generation prompt budget exhausted after draining at step "
+                        f"{self._bounded_global_steps}: available={available}, "
+                        f"required={self._bounded_batch_size}; all submitted groups have returned. "
+                        "No extra prompts were dispatched and no reward was fabricated."
+                    )
         return result
 
     def _wait_for_next_poll(self, partition_id, last_debug_time):
@@ -94,6 +127,7 @@ class BoundedSamplingMixin:
         self._igsm_generation_deadline = None
         return BoundedReplayBuffer(
             deadline_check=self._check_generation_deadline,
+            remaining_prompt_budget=self._remaining_generation_prompt_budget,
             trainer_mode=self.trainer_mode,
             trainer_config=self.config.trainer.v1.get(self.trainer_mode, {}),
             max_off_policy_threshold=sampler.max_off_policy_threshold,
@@ -106,6 +140,12 @@ class BoundedSamplingMixin:
             gen_batch_size=1,
             max_inflight_gen_batches=_get(groups, "max_inflight_gen_batches", 1),
         )
+
+    def _remaining_generation_prompt_budget(self):
+        limit = self._igsm_generation_prompt_limit
+        if limit is None:
+            raise RuntimeError("DAPO generation budget was not initialized before sampling")
+        return max(0, limit - self._igsm_generation_prompt_count)
 
     def on_step_begin(self):
         if self._dapo_filtering_enabled():

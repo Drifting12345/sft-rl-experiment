@@ -1,3 +1,25 @@
-All arithmetic is modulo 23. Solve the following problem using concise equations. Put the final numeric result after the lowercase prefix answer: on the last line.
+All arithmetic is modulo 23: reduce every addition, subtraction, and multiplication result to 0–22. "Difference of A and B" means (A - B) mod 23. Follow entity relationships and containment dependencies when computing totals.
 
+Solve the problem with concise equations.
+
+Output format:
+1. Show concise step-by-step equations.
+2. The final line must be exactly:
+answer: N
+where N is an integer from 0 to 22.
+3. No units, explanations, or extra text after the final line.
+
+Example:
+Problem:
+The number of each Dragon's Pons equals 8. The number of each Dragon's Frontal Lobe equals 6 more than each Dragon's Pons. The number of each Griffin's Hypothalamus equals 19. The number of each Griffin's Frontal Lobe equals 19 more than each Griffin's Hypothalamus. The number of each Dragon's Hypothalamus equals 6 times as much as the difference of each Griffin's Organs and each Griffin's Frontal Lobe. How many Hypothalamus does Dragon have?
+
+Solution:
+Griffin's Hypothalamus = 19.
+Griffin's Frontal Lobe = 19 + 19 = 15.
+Griffin's Organs = 19 + 15 = 11.
+Dragon's Hypothalamus base difference = 11 - 15 = 19.
+Dragon's Hypothalamus = 6 * 19 = 22.
+answer: 22
+
+Now solve:
 {problem}

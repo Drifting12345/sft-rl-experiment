@@ -311,6 +311,12 @@ class BaseModelMerger(ABC):
             except (TypeError, ValueError):
                 warnings.warn(f"Invalid lora_alpha in {meta_path}: {lora_meta['lora_alpha']}", stacklevel=2)
 
+        if "lora_dropout" in lora_meta:
+            dropout = float(lora_meta["lora_dropout"])
+            if not 0.0 <= dropout < 1.0:
+                raise ValueError(f"Invalid lora_dropout in {meta_path}: {dropout}")
+            result["lora_dropout"] = dropout
+
         if "task_type" in lora_meta:
             task_type = lora_meta["task_type"]
             if task_type is None:
@@ -388,6 +394,7 @@ class BaseModelMerger(ABC):
         peft_dict = {
             "r": lora_rank,
             "lora_alpha": lora_alpha,
+            "lora_dropout": lora_meta.get("lora_dropout", 0.0) if lora_meta else 0.0,
             "target_modules": list(target_modules),
         }
         if task_type is not None:

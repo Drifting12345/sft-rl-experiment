@@ -34,7 +34,7 @@ _STEP_DIRECTORY = re.compile(r"global_step_(0|[1-9][0-9]*)\Z")
 
 @dataclass
 class RewardEarlyStopState:
-    """Compare adjacent validation rewards; ties reset the decline streak."""
+    """Compare adjacent validation rewards; ties reset declines and select the latest best."""
 
     patience: int = 2
     previous_reward: float | None = None
@@ -62,7 +62,7 @@ class RewardEarlyStopState:
             if self.previous_reward is not None and reward < self.previous_reward
             else 0
         )
-        if self.best_reward is None or reward > self.best_reward:
+        if self.best_reward is None or reward >= self.best_reward:
             self.best_reward, self.best_step = float(reward), step
         self.previous_reward = float(reward)
         self.last_validation_step = step

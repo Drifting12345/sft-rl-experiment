@@ -12,7 +12,7 @@ import sys
 EXP = Path(__file__).resolve().parents[1]
 ROOT = EXP.parent
 sys.path.insert(0, str(EXP))
-from eval_qwen3_igsm import DATA_NAME, atomic_json, digest, read_examples, render_messages
+from eval_qwen3_igsm import DATA_NAME, atomic_json, digest, render_messages
 from sft.train_sft import read_records, reject_overlap, split_records
 
 
@@ -27,13 +27,13 @@ def validate_answers(rows: list[dict], description: str) -> None:
             raise ValueError(f"{description}, {row['id']}: generator seed exceeds int64")
 
 
-def encode_prompt(row: dict, split: str, tokenizer, template: str, examples: list[dict],
+def encode_prompt(row: dict, split: str, tokenizer, template: str,
                   max_prompt_length: int, max_response_length: int, max_model_len: int) -> tuple[dict, dict]:
     controls = [*tokenizer.all_special_tokens, "<think>", "</think>"]
     if any(token and token in row["problem"] for token in controls):
         raise ValueError(f"{row['id']}: special control token inside the question")
     # Only the question is exposed to the renderer: no label or solution field.
-    messages = render_messages(template, {"problem": row["problem"]}, examples)
+    messages = render_messages(template, {"problem": row["problem"]})
     prefix = tokenizer.apply_chat_template(messages, tokenize=False,
         add_generation_prompt=True, enable_thinking=False)
     token_ids = tokenizer(prefix, add_special_tokens=False, truncation=False)["input_ids"]
@@ -54,7 +54,7 @@ def encode_prompt(row: dict, split: str, tokenizer, template: str, examples: lis
 
 def prepare(input_path: Path, output_dir: Path, model: Path = ROOT / "models/Qwen3-0.6B", *,
             heldout_data: list[Path] | Path | None = None, seed: int = 42, dry_run: bool = False,
-            prompt: Path = EXP / "prompt.txt", examples: Path | None = EXP / "prompt_examples.json",
+            prompt: Path = EXP / "prompt.txt",
             max_prompt_length: int = 4096, max_response_length: int = 2048,
             max_model_len: int = 6144) -> dict:
     """Return reproducibility metadata; dry-run writes nothing and loads no weights.
@@ -95,8 +95,6 @@ def prepare(input_path: Path, output_dir: Path, model: Path = ROOT / "models/Qwe
     split_sha = digest(json.dumps(split_manifest, sort_keys=True, separators=(",", ":")).encode())
 
     template = prompt.read_text(encoding="utf-8")
-    examples_path = Path(examples) if examples is not None else None
-    example_messages, examples_sha, _ = read_examples(examples_path)
     config_path = model / "config.json"
     model_config = json.loads(config_path.read_text(encoding="utf-8"))
     context = model_config.get("max_position_embeddings")
@@ -111,7 +109,7 @@ def prepare(input_path: Path, output_dir: Path, model: Path = ROOT / "models/Qwe
         tokenizer.pad_token = tokenizer.eos_token
     datasets, token_stats = {}, {}
     for name, rows in (("train", train), ("validation", validation)):
-        pairs = [encode_prompt(row, name, tokenizer, template, example_messages,
+        pairs = [encode_prompt(row, name, tokenizer, template,
                     max_prompt_length, max_response_length, max_model_len) for row in rows]
         datasets[name] = [pair[0] for pair in pairs]
         per_record = [pair[1] for pair in pairs]
@@ -130,7 +128,6 @@ def prepare(input_path: Path, output_dir: Path, model: Path = ROOT / "models/Qwe
             ["tokenizer_config.json", "tokenizer.json", "vocab.json", "merges.txt", "special_tokens_map.json",
              "generation_config.json", "chat_template.jinja"] if (model / name).is_file()},
         "prompt": str(prompt.resolve()), "prompt_sha256": digest(template.encode("utf-8")),
-        "examples": str(examples_path.resolve()) if examples_path else None, "examples_sha256": examples_sha,
         "script_sha256": digest(Path(__file__).read_bytes()),
         "evaluation_helpers_sha256": digest((EXP / "eval_qwen3_igsm.py").read_bytes()),
         "split_helpers_sha256": digest((EXP / "sft/train_sft.py").read_bytes()),
@@ -167,8 +164,6 @@ def arguments():
     parser.add_argument("--heldout-data", type=Path, nargs="+", default=[ROOT / "data" / DATA_NAME])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--prompt", type=Path, default=EXP / "prompt.txt")
-    parser.add_argument("--examples", type=Path, default=EXP / "prompt_examples.json")
-    parser.add_argument("--no-examples", action="store_true")
     parser.add_argument("--max-prompt-length", type=int, default=4096)
     parser.add_argument("--max-response-length", type=int, default=2048)
     parser.add_argument("--max-model-len", type=int, default=6144)
@@ -180,6 +175,6 @@ if __name__ == "__main__":
     args = arguments()
     result = prepare(args.input, args.output_dir, args.model, heldout_data=args.heldout_data,
         seed=args.seed, dry_run=args.dry_run, prompt=args.prompt,
-        examples=None if args.no_examples else args.examples, max_prompt_length=args.max_prompt_length,
+        max_prompt_length=args.max_prompt_length,
         max_response_length=args.max_response_length, max_model_len=args.max_model_len)
     print(json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2))

@@ -703,13 +703,44 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
     return lora_params
 
 
+def get_fsdp_peft_model_state_dict(peft_model, state_dict=None):
+    """Match PEFT's module-based selection to FSDP's wrapper-free state keys.
+
+    PEFT 0.21 discovers adapter prefixes from named_modules(), while FSDP's
+    state_dict removes nested _fsdp_wrapped_module segments. Give PEFT a
+    shallow namespace view; do not mutate the live model or copy its weights.
+    """
+    import copy
+    from types import MethodType
+
+    from peft.utils.save_and_load import get_peft_model_state_dict
+
+    if state_dict is None:
+        state_dict = peft_model.state_dict()
+    marker = "_fsdp_wrapped_module."
+    if not any(marker in name for name, _ in peft_model.named_modules()):
+        return get_peft_model_state_dict(peft_model, state_dict=state_dict)
+    view = copy.copy(peft_model)
+
+    def named_modules(_self, *args, **kwargs):
+        for name, module in peft_model.named_modules(*args, **kwargs):
+            yield name.replace(marker, ""), module
+
+    def named_parameters(_self, *args, **kwargs):
+        for name, parameter in peft_model.named_parameters(*args, **kwargs):
+            yield name.replace(marker, ""), parameter
+
+    view.named_modules = MethodType(named_modules, view)
+    view.named_parameters = MethodType(named_parameters, view)
+    normalized = {name.replace(marker, ""): value for name, value in state_dict.items()}
+    return get_peft_model_state_dict(view, state_dict=normalized)
+
+
 def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool) -> OrderedDict:
     """
     collect lora params or full params if base model is not ready in vllm
     work with if isinstance(self.module._fsdp_wrapped_module, PeftModel)
     """
-    from peft.utils.save_and_load import get_peft_model_state_dict
-
     lora_params = OrderedDict()
     peft_model = getattr(module, "_fsdp_wrapped_module", module)
     if fsdp_version(module) > 0:
@@ -731,7 +762,7 @@ def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool
                     FSDP.summon_full_params(module, writeback=False, offload_to_cpu=True) if is_fsdp1 else nullcontext()
                 )
                 with summon_ctx:
-                    lora_params = get_peft_model_state_dict(peft_model)
+                    lora_params = get_fsdp_peft_model_state_dict(peft_model)
                     lora_params = {
                         name: param.full_tensor().detach().cpu()
                         if hasattr(param, "full_tensor")
@@ -742,7 +773,7 @@ def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool
         else:
             with FSDP.summon_full_params(module, writeback=False):
                 if base_sync_done:
-                    lora_params = get_peft_model_state_dict(peft_model)
+                    lora_params = get_fsdp_peft_model_state_dict(peft_model)
                     lora_params = {
                         name: param.full_tensor().detach().cpu()
                         if hasattr(param, "full_tensor")
@@ -766,7 +797,7 @@ def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool
             get_torch_device().empty_cache()
     else:
         if base_sync_done:
-            lora_params = get_peft_model_state_dict(peft_model)
+            lora_params = get_fsdp_peft_model_state_dict(peft_model)
         else:
             model = peft_model.base_model.model
             orig_dev = "cpu" if "cpu" in str(next(model.parameters()).device) else get_device_name()
@@ -777,6 +808,8 @@ def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool
                 name = name.replace("_fsdp_wrapped_module.", "").replace(".base_layer", "")
                 lora_params[name] = param.detach().cpu()
             model = model.to(orig_dev)
+    if base_sync_done and not lora_params:
+        raise RuntimeError("No LoRA parameters collected for rollout; check FSDP/PEFT namespace compatibility")
     return lora_params
 
 

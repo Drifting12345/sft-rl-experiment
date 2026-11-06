@@ -16,7 +16,11 @@ class RLTaskRunner:
         trainer = None
         succeeded = False
         try:
-            trainer = IGSMTrainer(config)
+            if config.igsm_rl.get("epoch_unit") == "data-pass":
+                from single_group_trainer import SingleGroupEpochTrainer
+                trainer = SingleGroupEpochTrainer(config)
+            else:
+                trainer = IGSMTrainer(config)
             trainer.init()
             manager = AgentLoopManagerTQ.create(config=config, llm_client=trainer.get_llm_client(),
                 teacher_client=trainer.get_teacher_client(), reward_loop_worker_handles=trainer.get_reward_handles())

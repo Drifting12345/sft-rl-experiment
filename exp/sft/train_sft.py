@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Single-GPU Qwen3 LoRA SFT with a held-out split and validation-loss early stopping."""
+"""Qwen3 LoRA SFT on one GPU or torchrun DDP, with validation-loss early stopping."""
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from contextlib import nullcontext
 from importlib.metadata import version
 import json
 import os
@@ -17,7 +18,7 @@ EXP = Path(__file__).resolve().parents[1]
 ROOT = EXP.parent
 sys.path.insert(0, str(EXP))
 from eval_qwen3_igsm import (  # noqa: E402
-    DATA_NAME, atomic_json, digest, read_examples, render_messages, run_lock,
+    DATA_NAME, atomic_json, digest, render_messages, run_lock,
 )
 
 
@@ -102,16 +103,16 @@ def target_text(row: dict) -> str:
         solution = "\n".join(lines[:-1]).strip()
     if not solution or any(line.strip().startswith("answer:") for line in solution.splitlines()):
         raise ValueError(f"{row['id']}: expected a worked solution and one final answer")
-    return f"{solution}\nanswer:{row['answer']}"
+    return f"{solution}\nanswer: {row['answer']}"
 
 
-def encode_record(row: dict, tokenizer, template: str, examples: list[dict],
+def encode_record(row: dict, tokenizer, template: str,
                   max_length: int, max_response_tokens: int) -> tuple[dict, dict]:
     target = target_text(row)
     for text in [row["problem"], target]:
         if any(token in text for token in [*tokenizer.all_special_tokens, "<think>", "</think>"]):
             raise ValueError(f"{row['id']}: special control tokens inside data")
-    messages = render_messages(template, row, examples)
+    messages = render_messages(template, row)
     prefix = tokenizer.apply_chat_template(messages, tokenize=False,
         add_generation_prompt=True, enable_thinking=False)
     complete = tokenizer.apply_chat_template(messages + [{"role": "assistant", "content": target}],
@@ -162,8 +163,6 @@ def arguments():
                         help="Protected test sets checked for train/validation question and seed overlap")
     parser.add_argument("--model", type=Path, default=ROOT / "models/Qwen3-0.6B")
     parser.add_argument("--prompt", type=Path, default=EXP / "prompt.txt")
-    parser.add_argument("--examples", type=Path, default=EXP / "prompt_examples.json")
-    parser.add_argument("--no-examples", action="store_true", help="Train with a single user message instead")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume-from-checkpoint", type=Path)
     parser.add_argument("--max-length", type=int, default=8192)
@@ -192,8 +191,6 @@ def arguments():
         parser.error("LoRA rank/alpha and early-stopping patience must be positive")
     if not 0 <= args.lora_dropout < 1:
         parser.error("lora-dropout must be in [0, 1)")
-    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
-        parser.error("This entry point supports one GPU; do not launch it with torchrun")
     return args
 
 
@@ -210,8 +207,6 @@ def main():
     train_rows, validation, split_manifest = split_records(pool, args.seed)
     split_sha = digest(json.dumps(split_manifest, sort_keys=True, separators=(",", ":")).encode())
     template = args.prompt.read_text(encoding="utf-8")
-    example_path = None if args.no_examples else args.examples
-    examples, examples_sha, examples_raw = read_examples(example_path)
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model.resolve(), local_files_only=True, trust_remote_code=False)
@@ -225,12 +220,12 @@ def main():
         raise ValueError("max-length exceeds the model context window")
     datasets, lengths = {}, {}
     for name, rows in [("train", train_rows), ("validation", validation)]:
-        pairs = [encode_record(row, tokenizer, template, examples, args.max_length, args.max_response_tokens) for row in rows]
+        pairs = [encode_record(row, tokenizer, template, args.max_length, args.max_response_tokens) for row in rows]
         datasets[name] = [pair[0] for pair in pairs]
         lengths[name] = [pair[1] for pair in pairs]
     config = {
         "schema_version": 2, "method": "lora_sft", "thinking": False,
-        "loss": "target assistant solution + final numeric answer + EOS; prefix/examples/padding masked",
+        "loss": "target assistant solution + final numeric answer + EOS; prompt/padding masked",
         "train_data": str(args.train_data.resolve()), "train_sha256": train_sha,
         "split_manifest_sha256": split_sha, "split_seed": args.seed,
         "validation_fraction": 0.1, "actual_validation_fraction": len(validation) / len(pool),
@@ -241,13 +236,15 @@ def main():
             for name in ["tokenizer.json", "vocab.json", "merges.txt", "generation_config.json", "chat_template.jinja"]
             if (args.model / name).is_file()},
         "prompt": str(args.prompt.resolve()), "prompt_sha256": digest(template.encode()),
-        "examples": str(example_path.resolve()) if example_path else None, "examples_sha256": examples_sha,
         "script_sha256": digest(Path(__file__).read_bytes()),
         "evaluation_helpers_sha256": digest((EXP / "eval_qwen3_igsm.py").read_bytes()),
         "early_stopping_sha256": digest(Path(__file__).with_name("early_stopping.py").read_bytes()),
         "versions": {name: version(name) for name in ["transformers", "torch", "accelerate", "peft", "tokenizers"]},
         "hyperparameters": {name: getattr(args, name) for name in ["max_length", "max_response_tokens", "epochs",
             "learning_rate", "micro_batch_size", "gradient_accumulation_steps", "max_steps", "seed"]},
+        "distributed": {"world_size": int(os.environ.get("WORLD_SIZE", "1")),
+                        "effective_batch_size": args.micro_batch_size * args.gradient_accumulation_steps
+                                                * int(os.environ.get("WORLD_SIZE", "1"))},
         "optimizer": "adamw_torch", "weight_decay": 0.01, "warmup_ratio": 0.03,
         "lr_scheduler": "cosine", "dtype": "bfloat16", "attention": "sdpa", "gradient_checkpointing": True,
         "lora": {"rank": args.lora_r, "alpha": args.lora_alpha, "dropout": args.lora_dropout,
@@ -256,10 +253,11 @@ def main():
                            "patience": args.early_stopping_patience, "comparison": "previous_epoch",
                            "rule": "strict loss increase increments; tie or decrease resets", "frequency": "epoch"},
     }
-    print(json.dumps({"config": config, "lengths": {name: {
-        "count": len(items), "max_total_tokens": max((x["total_tokens"] for x in items), default=0),
-        "max_response_tokens": max((x["response_tokens"] for x in items), default=0),
-    } for name, items in lengths.items()}}, indent=2), flush=True)
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(json.dumps({"config": config, "lengths": {name: {
+            "count": len(items), "max_total_tokens": max((x["total_tokens"] for x in items), default=0),
+            "max_response_tokens": max((x["response_tokens"] for x in items), default=0),
+        } for name, items in lengths.items()}}, indent=2), flush=True)
     if args.dry_run:
         print("DRY_RUN_PASSED: no model weights loaded, GPU training or output directory created", flush=True)
         return
@@ -270,8 +268,10 @@ def main():
     from early_stopping import ConsecutiveWorseningCallback
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError("This BF16 recipe requires a CUDA GPU with BF16 support")
-    if torch.cuda.device_count() != 1:
-        raise RuntimeError("Select exactly one GPU with CUDA_VISIBLE_DEVICES for this training entry point")
+    from accelerate.state import PartialState
+    distributed = PartialState()
+    if distributed.num_processes == 1 and torch.cuda.device_count() != 1:
+        raise RuntimeError("Select one GPU, or launch one torchrun process per GPU")
     output = args.output_dir.resolve()
     checkpoint = args.resume_from_checkpoint.resolve() if args.resume_from_checkpoint else None
     if checkpoint:
@@ -281,23 +281,24 @@ def main():
             raise ValueError("Resume inputs/settings/source differ from the original run")
         if json.loads((output / "split_manifest.json").read_text()) != split_manifest:
             raise ValueError("Resume split differs from the saved partition")
-        for name in ["trainer_state.json", "optimizer.pt", "scheduler.pt", "rng_state.pth"]:
+        rng_name = ("rng_state.pth" if distributed.num_processes == 1
+                    else f"rng_state_{distributed.process_index}.pth")
+        for name in ["trainer_state.json", "optimizer.pt", "scheduler.pt", rng_name]:
             if not (checkpoint / name).is_file():
                 raise ValueError(f"Resume checkpoint is missing {name}; model-only export cannot resume training")
-    elif output.exists() and any(output.iterdir()):
+    elif distributed.is_main_process and output.exists() and any(output.iterdir()):
         raise ValueError("Output directory is not empty; use a fresh directory or explicit resume")
     output.mkdir(parents=True, exist_ok=True)
-    with run_lock(output):
-        if not checkpoint:
+    with (run_lock(output) if distributed.is_main_process else nullcontext()):
+        if not checkpoint and distributed.is_main_process:
             atomic_json(output / "sft_config.json", config)
             atomic_json(output / "token_lengths.json", lengths)
             atomic_json(output / "split_manifest.json", split_manifest)
             (output / "prompt.txt").write_text(template, encoding="utf-8")
-            if examples_raw is not None:
-                (output / "examples.json").write_bytes(examples_raw)
             shutil.copyfile(__file__, output / "train_sft.py")
             shutil.copyfile(EXP / "eval_qwen3_igsm.py", output / "evaluation_helpers.py")
             shutil.copyfile(Path(__file__).with_name("early_stopping.py"), output / "early_stopping.py")
+        distributed.wait_for_everyone()
         set_seed(args.seed)
         model = AutoModelForCausalLM.from_pretrained(args.model.resolve(), local_files_only=True,
             trust_remote_code=False, dtype=torch.bfloat16, attn_implementation="sdpa")
@@ -306,7 +307,8 @@ def main():
             lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
             target_modules=args.lora_target_modules, bias="none"))
         model.enable_input_require_grads()
-        model.print_trainable_parameters()
+        if distributed.is_main_process:
+            model.print_trainable_parameters()
         training_args = TrainingArguments(output_dir=str(output), num_train_epochs=args.epochs,
             max_steps=args.max_steps, learning_rate=args.learning_rate, weight_decay=0.01,
             warmup_steps=0.03, lr_scheduler_type="cosine", optim="adamw_torch",
@@ -318,33 +320,57 @@ def main():
             restore_callback_states_from_checkpoint=True,
             save_total_limit=2, save_only_model=False, logging_steps=10,
             report_to="none", prediction_loss_only=True, remove_unused_columns=False,
-            dataloader_num_workers=0, seed=args.seed, data_seed=args.seed)
-        trainer = Trainer(model=model, args=training_args, train_dataset=datasets["train"],
+            dataloader_num_workers=0, seed=args.seed, data_seed=args.seed,
+            ddp_find_unused_parameters=False, disable_tqdm=True)
+        class AdapterTrainer(Trainer):
+            def _load_best_model(self):
+                # Copy only adapter tensors into this rank's existing model.
+                # Avoid PEFT's automatic device-map dispatch inside DDP.
+                from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
+                target = self.accelerator.unwrap_model(self.model)
+                assert len(target.active_adapters) == 1
+                active = target.active_adapters[0]
+                for name, parameter in target.named_parameters():
+                    if "lora_" in name and parameter.device != self.args.device:
+                        raise RuntimeError(f"Adapter on wrong rank device: {name}: {parameter.device}")
+                weights = load_peft_weights(self.state.best_model_checkpoint, device="cpu")
+                loaded = set_peft_model_state_dict(target, weights, adapter_name=active)
+                missing = [key for key in loaded.missing_keys if "lora_" in key]
+                if missing or loaded.unexpected_keys:
+                    raise RuntimeError(f"Best adapter load mismatch: {missing}, {loaded.unexpected_keys}")
+                if self.is_world_process_zero():
+                    print(f"BEST_ADAPTER_LOADED: {self.state.best_model_checkpoint}; CPU copy", flush=True)
+
+        trainer = AdapterTrainer(model=model, args=training_args, train_dataset=datasets["train"],
             eval_dataset=datasets["validation"] if validation else None,
             processing_class=tokenizer, data_collator=CompletionCollator(tokenizer.pad_token_id),
             callbacks=[ConsecutiveWorseningCallback(patience=args.early_stopping_patience)])
         result = trainer.train(resume_from_checkpoint=str(checkpoint) if checkpoint else None)
         trainer.save_state()
         trainer.save_metrics("train", result.metrics)
-        trained = trainer.accelerator.unwrap_model(trainer.model)
-        adapter = output / "best_adapter"
-        trained.save_pretrained(adapter, safe_serialization=True)
-        tokenizer.save_pretrained(adapter)
-        merged = trained.merge_and_unload(safe_merge=True)
-        merged.config.use_cache = True
-        final = output / "final"
-        if (final / "adapter_config.json").exists():
-            raise ValueError("final/ must contain only a merged model, not a PEFT adapter")
-        merged.save_pretrained(final, safe_serialization=True)
-        tokenizer.save_pretrained(final)
-        stopping = next(callback for callback in trainer.callback_handler.callbacks if isinstance(callback, ConsecutiveWorseningCallback))
-        atomic_json(output / "result.json", {"complete": True, "global_step": trainer.state.global_step,
-                    "best_checkpoint": trainer.state.best_model_checkpoint,
-                    "best_validation_loss": trainer.state.best_metric, "epoch": trainer.state.epoch,
-                    "early_stopping_counter": stopping.consecutive_increases,
-                    "early_stopped": stopping.consecutive_increases >= args.early_stopping_patience,
-                    "adapter": str(adapter), "final_model": str(final), "metrics": result.metrics})
-        print(f"SFT_COMPLETE: {final}", flush=True)
+        distributed.wait_for_everyone()
+        if trainer.is_world_process_zero():
+            trained = trainer.accelerator.unwrap_model(trainer.model)
+            adapter = output / "best_adapter"
+            trained.save_pretrained(adapter, safe_serialization=True)
+            tokenizer.save_pretrained(adapter)
+            merged = trained.merge_and_unload(safe_merge=True)
+            merged.config.use_cache = True
+            final = output / "final"
+            if (final / "adapter_config.json").exists():
+                raise ValueError("final/ must contain only a merged model, not a PEFT adapter")
+            merged.save_pretrained(final, safe_serialization=True)
+            tokenizer.save_pretrained(final)
+            stopping = next(callback for callback in trainer.callback_handler.callbacks if isinstance(callback, ConsecutiveWorseningCallback))
+            atomic_json(output / "result.json", {"complete": True, "global_step": trainer.state.global_step,
+                        "best_checkpoint": trainer.state.best_model_checkpoint,
+                        "best_validation_loss": trainer.state.best_metric, "epoch": trainer.state.epoch,
+                        "early_stopping_counter": stopping.consecutive_increases,
+                        "early_stopped": stopping.consecutive_increases >= args.early_stopping_patience,
+                        "adapter": str(adapter), "final_model": str(final), "metrics": result.metrics})
+            print(f"SFT_COMPLETE: {final}", flush=True)
+        distributed.wait_for_everyone()
+
 
 
 if __name__ == "__main__":

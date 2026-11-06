@@ -16,7 +16,7 @@
 | `.conda/envs/verl-train/` | 实际的训练与推理 Conda 环境 |
 | `data/` | 正式 JSONL 数据集 |
 | `models/` | 四个 Qwen3 模型及固定版本恢复工具 |
-| `exp/` | 固定提示词、两对 toy 示例和独立 pass@k 推理评测 |
+| `exp/` | 内嵌 easy 示例的完整默认提示词和独立 pass@k 推理评测 |
 | `exp/sft/` | LoRA 监督微调、验证 loss 早停、adapter 与合并模型导出 |
 | `exp/rl/` | GRPO / DAPO、二值答案奖励、验证奖励早停和 checkpoint 恢复 |
 | `.cache/` | 下载及运行缓存 |
@@ -69,7 +69,7 @@ dry-run 检查数据、泄漏、模板 token 长度和配置，不加载模型�
 
 ## SFT 与 RL 当前实现
 
-两类训练都复用模 23 的主提示词、固定的两对 toy 示例以及关闭 thinking 的输入模板，独立推理评测最多生成 2048 tokens；不提供正式评测答案或历史纠错反馈。
+两类训练与独立评测共用 `exp/prompt.txt`，其中完整包含模 23、差值方向、实体包含关系和一道 easy 示例，使用关闭 thinking 的单条 user 输入。独立推理评测最多生成 2048 tokens；不提供正式评测答案或历史纠错反馈。
 
 | 项目 | LoRA SFT | GRPO / DAPO RL |
 | --- | --- | --- |
@@ -159,11 +159,11 @@ git push
 
 无效作答共 **1761 次**，其中长度截断 **753 次**；其余无效情况包括输出格式与未完整结束等。判分要求完整生成且最终答案数字正确，截断输出不因已有数字看似正确而通过。这些是本轮固定输入和采样配置的完成结果，不能据此推断 SFT/RL 已有提升。
 
-`exp/prompt.txt` 使用简短主指令：全部计算按模 23 进行、使用简洁等式推导，末行用小写 `answer:` 紧接实际整数，随后附上当前题面。可选的 `--examples PATH` 在当前题目前加入固定的 user/assistant 示范；不传时仍只发送当前题目的单条 user 消息。
+`exp/prompt.txt` 保存完整默认提示词：先说明模 23、差值和包含关系，再给出一道 Dragon/Griffin easy 示例及解答，最后由 `Now solve: {problem}` 插入当前题面。最终输出要求 `answer: N`，N 是 0–22 的整数。
 
-`exp/prompt_examples.json` 包含两对人工 toy 计算：`4 * 6 mod 23 = 1` 和 `18 + 10 mod 23 = 5`。带示例运行时显式传入 `--examples prompt_examples.json`（从 `exp` 目录解析），所有题和尝试复用同两对示例，不提供正式 100 题的参考答案或历史纠错反馈。选用示例的每轮保存示例快照及 SHA256，完整输入消息和 token IDs 记录在 `prompts.jsonl`；few-shot 轮与旧单 user 提示的结果分开统计。
+评测、SFT 和 RL 都使用这份完整模板，不再加载独立示例文件或额外示例消息。完整模板及其 SHA256、实际输入消息和 token IDs 保存在每次运行的快照中。
 
-这次正式 baseline 使用上述两对 toy 示例。few-shot 结果与旧单 user 提示的结果分开统计。逐次回答、日志和结果文件按根 `.gitignore` 留在开发机，仓库 README 仅记录这份静态完成结果。
+上面记录的历史正式 baseline 使用旧主指令和两对单步 toy 示例；新模板内嵌一道 easy 示例，两者属于不同提示配置，评测结果分别记录。逐次回答、日志和结果文件按根 `.gitignore` 留在开发机，仓库 README 仅记录静态完成结果。
 
 ## 查看后续运行
 

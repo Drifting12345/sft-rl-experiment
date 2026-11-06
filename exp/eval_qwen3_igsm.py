@@ -78,29 +78,8 @@ def render_prompt(template: str, row: dict) -> str:
     return template.replace("{problem}", row["problem"])
 
 
-def read_examples(path: Path | None) -> tuple[list[dict], str | None, bytes | None]:
-    if path is None:
-        return [], None, None
-    raw = path.read_bytes()
-    messages = json.loads(raw)
-    if not isinstance(messages, list) or not messages or len(messages) % 2:
-        raise ValueError("Examples must contain complete user/assistant message pairs")
-    for index, message in enumerate(messages):
-        expected_role = "user" if index % 2 == 0 else "assistant"
-        if not isinstance(message, dict) or set(message) != {"role", "content"}:
-            raise ValueError(f"Example {index}: expected only role and content")
-        if message["role"] != expected_role:
-            raise ValueError(f"Example {index}: expected role {expected_role!r}")
-        content = message["content"]
-        if not isinstance(content, str) or not content.strip() or "{problem}" in content:
-            raise ValueError(f"Example {index}: content must be nonempty and contain no {{problem}}")
-    return messages, digest(raw), raw
-
-
-def render_messages(template: str, row: dict, examples: list[dict]) -> list[dict]:
-    return [dict(message) for message in examples] + [
-        {"role": "user", "content": render_prompt(template, row)}
-    ]
+def render_messages(template: str, row: dict) -> list[dict]:
+    return [{"role": "user", "content": render_prompt(template, row)}]
 
 
 def parse_answer(text: str, finish_reason: str) -> tuple[int | None, str]:
@@ -265,7 +244,6 @@ def arguments():
     parser.add_argument("--data", type=Path, default=ROOT / "data" / DATA_NAME)
     parser.add_argument("--model", type=Path, default=ROOT / "models/Qwen3-0.6B")
     parser.add_argument("--prompt", type=Path, default=Path(__file__).with_name("prompt.txt"))
-    parser.add_argument("--examples", type=Path, help="Optional JSON user/assistant message pairs")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Validate data and tokenized prompts without a GPU engine")
@@ -280,6 +258,8 @@ def arguments():
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--execution-mode", choices=["eager", "cudagraph"], default="eager",
+                        help="cudagraph captures decode execution without torch.compile")
     parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
     args.pass_k = sorted(set(args.pass_k))
@@ -311,8 +291,7 @@ def main() -> None:
             raise ValueError("limit exceeds the dataset size")
         rows = rows[:args.limit]
     template = args.prompt.read_text(encoding="utf-8")
-    examples, examples_sha, examples_raw = read_examples(args.examples)
-    messages = {row["id"]: render_messages(template, row, examples) for row in rows}
+    messages = {row["id"]: render_messages(template, row) for row in rows}
     user_prompts = {question_id: items[-1]["content"] for question_id, items in messages.items()}
 
     from transformers import AutoTokenizer
@@ -337,12 +316,10 @@ def main() -> None:
         "tokenizer_config_sha256": digest((model / "tokenizer_config.json").read_bytes()),
         "generation_config_sha256": digest((model / "generation_config.json").read_bytes()),
         "prompt_sha256": digest(template.encode("utf-8")),
-        "examples": str(args.examples.resolve()) if args.examples is not None else None,
-        "examples_sha256": examples_sha,
         "script_sha256": digest(Path(__file__).read_bytes()),
         **{name: getattr(args, name) for name in [
             "pass_k", "max_attempts", "max_tokens", "max_model_len", "batch_size",
-            "gpu_memory_utilization", "temperature", "top_p", "top_k", "seed", "thinking",
+            "gpu_memory_utilization", "temperature", "top_p", "top_k", "seed", "thinking", "execution_mode",
         ]},
         "versions": {name: version(name) for name in ["transformers", "torch", "vllm"]},
         "answer_format": "lowercase answer: followed by the actual integer in 0..22; unfinished/truncated output is incorrect",
@@ -367,13 +344,9 @@ def main() -> None:
         if args.resume:
             if json.loads(config_path.read_text(encoding="utf-8")) != config:
                 raise ValueError("Resume configuration differs; use the original inputs/settings/script")
-            if examples_sha is not None and digest((output / "examples.json").read_bytes()) != examples_sha:
-                raise ValueError("Saved examples differ from the original run")
         else:
             atomic_json(config_path, config)
             (output / "prompt.txt").write_text(template, encoding="utf-8")
-            if examples_raw is not None:
-                (output / "examples.json").write_bytes(examples_raw)
             with (output / "prompts.jsonl").open("x", encoding="utf-8") as stream:
                 for row in rows:
                     stream.write(json.dumps({"id": row["id"], "user_prompt": user_prompts[row["id"]],
@@ -386,7 +359,9 @@ def main() -> None:
         if not summary["complete"]:
             from vllm import LLM, SamplingParams
             engine = LLM(model=str(model), tokenizer=str(model), dtype="bfloat16",
-                         tensor_parallel_size=1, seed=args.seed, enforce_eager=True,
+                         tensor_parallel_size=1, seed=args.seed, enforce_eager=args.execution_mode == "eager",
+                         compilation_config={"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}
+                         if args.execution_mode == "cudagraph" else {"mode": 0, "cudagraph_mode": "NONE"},
                          gpu_memory_utilization=args.gpu_memory_utilization,
                          max_model_len=args.max_model_len, max_num_seqs=args.batch_size,
                          enable_prefix_caching=True, trust_remote_code=False, disable_log_stats=True)

@@ -106,6 +106,7 @@ def main():
     parser.add_argument("--repo", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--count", type=int, default=100)
+    parser.add_argument("--id-prefix", default="igsm-hard-long")
     parser.add_argument("--min-solution-tokens", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=4)
@@ -115,9 +116,12 @@ def main():
     parser.add_argument("--max-op", type=int, default=21)
     parser.add_argument("--max-edge", type=int, default=28)
     parser.add_argument("--op", type=int, default=None)
+    parser.add_argument("--perm-level", type=int, choices=range(7), default=5,
+                        help="0-4 mild shuffle; 5 full shuffle; 6 no shuffle")
     args = parser.parse_args()
     assert args.count > 0 and args.min_solution_tokens > 0 and args.workers > 0
-    PARAMS = dict(PARAMS, max_op=args.max_op, max_edge=args.max_edge, op=args.op)
+    PARAMS = dict(PARAMS, max_op=args.max_op, max_edge=args.max_edge, op=args.op,
+                  perm_level=args.perm_level)
     assert args.max_op > 0 and args.max_edge > 1
     assert args.op is None or 1 <= args.op <= args.max_op
     output = args.output.resolve()
@@ -153,7 +157,7 @@ def main():
                 reasons[reason] += 1
                 if reason == "accepted":
                     seen.add(row["problem_sha256"])
-                    row["id"] = f"igsm-hard-long-{len(examples)+1:04d}"
+                    row["id"] = f"{args.id_prefix}-{len(examples)+1:04d}"
                     examples.append(row)
                     stream.write(json.dumps(row, ensure_ascii=False) + "\n")
                     stream.flush()
@@ -178,7 +182,7 @@ def main():
         hash_bins=list(range(23)), p_format="pq", tokenizer="gpt2",
         token_count_scope="solution only; excludes question, final answer field and special markers",
         truncation=False, padding=False, source_commit=source_commit,
-        seed_start=args.seed, workers=args.workers,
+        seed_start=args.seed, workers=args.workers, id_prefix=args.id_prefix,
         script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         dataset_sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
         package_versions={name: importlib.metadata.version(name) for name in ("torch", "transformers", "numpy", "networkx")},

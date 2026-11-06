@@ -364,6 +364,7 @@ class FSDPEngine(BaseEngine):
                 "task_type": TaskType.CAUSAL_LM,
                 "r": self.model_config.lora_rank,
                 "lora_alpha": self.model_config.lora_alpha,
+                "lora_dropout": self.model_config.lora.get("dropout", 0.0),
                 "target_modules": convert_to_regular_types(self.model_config.target_modules),
                 "target_parameters": convert_to_regular_types(self.model_config.target_parameters),
                 "exclude_modules": convert_to_regular_types(self.model_config.exclude_modules),
@@ -371,18 +372,12 @@ class FSDPEngine(BaseEngine):
             }
             module = get_peft_model(module, LoraConfig(**lora_config))
 
-            # FSDP requires all params in a flat group to share dtype: cast a
-            # fp32 adapter to the bf16 base dtype only when they actually differ.
-            base_dtype = next((p.dtype for p in module.parameters() if not p.requires_grad), None)
-            if base_dtype is not None:
-                mismatched = [p for p in module.parameters() if p.requires_grad and p.dtype != base_dtype]
-                if mismatched:
-                    logger.info(
-                        f"Casting {len(mismatched)} LoRA adapter params from "
-                        f"{mismatched[0].dtype} to {base_dtype} to match base."
-                    )
-                    for param in mismatched:
-                        param.data = param.data.to(base_dtype)
+        # Keep trainable master weights in FP32. LoRA-aware FSDP wrapping
+        # isolates these leaves from the frozen BF16 base; MixedPrecision
+        # handles the compute cast without rounding away optimizer updates.
+        for parameter in module.parameters():
+            if parameter.requires_grad and parameter.is_floating_point():
+                parameter.data = parameter.data.to(torch.float32)
 
         return module
 
@@ -402,7 +397,10 @@ class FSDPEngine(BaseEngine):
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
 
-        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+        mixed_precision = MixedPrecision(
+            param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype,
+            cast_forward_inputs=True,
+        )
 
         self._autocast_dtype = param_dtype
         # fp16 training requires loss scaling to avoid gradient underflow. Mirror the pattern
@@ -500,6 +498,11 @@ class FSDPEngine(BaseEngine):
     def _build_optimizer(self, module):
         from verl.workers.config.optimizer import build_optimizer
 
+        if self.model_config.lora_rank > 0:
+            invalid = [name for name, parameter in module.named_parameters()
+                       if parameter.requires_grad and parameter.dtype != torch.float32]
+            if invalid:
+                raise ValueError(f"LoRA optimizer requires FP32 master parameters: {invalid[:3]}")
         optimizer = build_optimizer(module.parameters(), self.optimizer_config)
 
         return optimizer

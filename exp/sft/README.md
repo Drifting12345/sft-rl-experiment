@@ -2,7 +2,7 @@
 
 本目录提供基于原始 Qwen3-0.6B 的 LoRA 监督微调入口，复用既有 `verl-train` Conda 环境，使用 Hugging Face Trainer 和 PEFT 0.21.2，不新建环境。
 
-**尚未执行 GPU SFT。**本版先进行 CPU/dry-run 与数据、标签和回调状态检查，不自动生成训练数据或启动训练；检查结果以实际运行输出为准。实际脚本参数以 `python train_sft.py --help` 为准。
+支持单卡和 torchrun DDP。2026-11-04 正在执行五档独立基模实验，详见本文末尾的实际运行记录。
 
 ## 数据准备与拆分
 
@@ -20,7 +20,7 @@
 当前固定 100 题文件是保留的评测基准，**不得传给 `--train-data`**：
 
 ```text
-/inspire/hdd/project/deepanalysis/guitao-25013/zfy/data/igsm_hard_long_100_op52_gpt2_ge1024_20261030.jsonl
+/root/sft-rl-experiment/data/igsm_hard_long_100_op52_gpt2_ge1024_20261030.jsonl
 ```
 
 `--heldout-data` 默认指向这份固定基准。完整的新数据池不能与 heldout 有相同题面或相同 `seed`；仅改 ID、文件名或记录顺序不能形成新数据。固定 100 题不参与梯度训练、训练/验证划分或每个 epoch 的最佳模型选择。
@@ -36,12 +36,12 @@
 用户输入使用模 23 规则、当前题面及最终数字格式要求。assistant 目标由参考解答追加最后一行组成：
 
 ```python
-assistant_text = row["solution"].rstrip() + f"\nanswer:{int(row['answer'])}"
+assistant_text = row["solution"].rstrip() + f"\nanswer: {int(row['answer'])}"
 ```
 
 最终前缀为小写 `answer:`，后面是实际整数。加、减、乘均使用模 23；目标不增加模型专用 thinking 内容，聊天模板使用 thinking 关闭模式。
 
-默认复用上层 `prompt.txt` 和 `prompt_examples.json`，与当前评测输入保持一致；用 `--no-examples` 可关闭固定示例，后续评测也需使用相同输入方式。只对最后一个 assistant 的解答、数字答案和 EOS 计算 loss，题目、两对人工示例、空 thinking 前缀与 padding 都不参与监督。脚本逐题断言训练序列与评测的输入 token 前缀完全一致。
+默认读取上层 `prompt.txt`，与评测和 RL 使用同一份完整模板，其中已内嵌一道 easy 示例。只对最后一个 assistant 的当前解答、数字答案和 EOS 计算 loss；整个 user 消息（含内嵌示例）、空 thinking 前缀与 padding 均不参与监督。脚本逐题断言训练序列与评测输入 token 前缀完全一致。
 
 序列长度按 Qwen tokenizer 处理后的完整对话计算，包含输入与目标；超过 `--max-length` 或目标超过 `--max-response-tokens`（默认 2048）的样本报错，不截断长样本。数据生成时的“solution 至少 1024 GPT-2 tokens”与这里的 Qwen 序列长度不是同一口径。
 
@@ -87,8 +87,8 @@ checkpoint 保存上一轮验证 loss、`counter` 等回调状态，续训时恢
 使用已有独立 Conda 环境，避免混入 iGSM 数据生成环境的依赖：
 
 ```bash
-source /inspire/hdd/project/deepanalysis/guitao-25013/zfy/verl/setup/activate.sh
-cd /inspire/hdd/project/deepanalysis/guitao-25013/zfy/exp/sft
+source /root/sft-rl-experiment/verl/setup/activate.sh
+cd /root/sft-rl-experiment/exp/sft
 ```
 
 先执行 CPU dry-run，核对新数据池、heldout 泄漏、按 seed 分组的划分、模板、assistant 标签范围及完整序列长度。dry-run 不启动 GPU 训练，通过也不等于 GPU 训练验收。
@@ -96,7 +96,7 @@ cd /inspire/hdd/project/deepanalysis/guitao-25013/zfy/exp/sft
 ```bash
 bash run_sft.sh \
   --train-data /absolute/path/new_pool.jsonl \
-  --heldout-data /inspire/hdd/project/deepanalysis/guitao-25013/zfy/data/igsm_hard_long_100_op52_gpt2_ge1024_20261030.jsonl \
+  --heldout-data /root/sft-rl-experiment/data/igsm_hard_long_100_op52_gpt2_ge1024_20261030.jsonl \
   --output-dir runs/qwen3-0.6b-lora \
   --dry-run
 ```
@@ -106,7 +106,7 @@ bash run_sft.sh \
 ```bash
 python train_sft.py \
   --train-data /absolute/path/new_pool.jsonl \
-  --heldout-data /inspire/hdd/project/deepanalysis/guitao-25013/zfy/data/igsm_hard_long_100_op52_gpt2_ge1024_20261030.jsonl \
+  --heldout-data /root/sft-rl-experiment/data/igsm_hard_long_100_op52_gpt2_ge1024_20261030.jsonl \
   --output-dir /absolute/path/exp/sft/runs/qwen3-0.6b-lora
 ```
 
@@ -129,7 +129,7 @@ python train_sft.py \
 ```bash
 bash run_sft.sh \
   --train-data /absolute/path/new_pool.jsonl \
-  --heldout-data /inspire/hdd/project/deepanalysis/guitao-25013/zfy/data/igsm_hard_long_100_op52_gpt2_ge1024_20261030.jsonl \
+  --heldout-data /root/sft-rl-experiment/data/igsm_hard_long_100_op52_gpt2_ge1024_20261030.jsonl \
   --output-dir runs/qwen3-0.6b-lora \
   --resume-from-checkpoint runs/qwen3-0.6b-lora/checkpoint-100
 ```
@@ -141,9 +141,23 @@ bash run_sft.sh \
 ```bash
 python ../eval_qwen3_igsm.py \
   --model runs/qwen3-0.6b-lora/final \
-  --examples ../prompt_examples.json \
   --max-tokens 2048 --no-thinking \
   --output-dir ../runs/qwen3-0.6b-lora-eval
 ```
 
 本次只编写和检查脚本，不自动生成数据、不启动 GPU SFT，也不中断已有基线评测。GPU 训练需在之后单独启动。
+
+## 五档八卡实际运行（2026-11-04，v2）
+
+顺序：100 → 10000 → 5000 → 500 → 200，每组训练后立即评测；每次从 Qwen3-0.6B 初始化新 LoRA，不跨组续训。
+使用 data/train/train_N.jsonl；最终 test 固定为 data/test/test_100.jsonl 的100题。
+内部按 seed=42 划分90%训练、10%验证。五组实际训练/验证数为90/10、9000/1000、4500/500、450/50、180/20。
+torchrun --standalone --nproc_per_node=8，每卡 microbatch=1，梯度累积=1，有效batch=8。
+其他默认训练参数保持一致。LoRA r16/alpha32/dropout0.05，学习率2e-4，最多10epoch；连续两次验证loss严格升高早停，以最低验证loss选择最佳adapter。
+v2最佳adapter通过CPU tensor直接复制到各rank已有模型，避免PEFT按旧CPU device_map自动跨卡分配。
+主rank写配置并导出完整final/；checkpoint保留各rank RNG状态。v1失败运行和checkpoint保留。
+训练输出：exp/sft/runs/qwen3-0.6b-trainN-20261104-v2/。
+评测输出：exp/runs/qwen3-0.6b-sft-trainN-test100-20261104-v2/。
+统一评测thinking关闭，temperature0.6/top_p0.95/top_k20，seed42，每题最多50次、单次2048tokens；报告pass@1/3/8/50。
+完成后汇总：exp/sft/runs/qwen3-0.6b-data-size-20261104-v2/README.md 与 comparison.json。
+后台日志与状态：/root/sft-env-setup-20261104/sft-data-size-v2/。

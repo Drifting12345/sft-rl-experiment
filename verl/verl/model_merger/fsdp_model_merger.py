@@ -190,7 +190,9 @@ class FSDPModelMerger(BaseModelMerger):
                 # add tensor shard in order of rank to state_dict[key]
                 tensor = model_state_shard.pop(key)
                 if isinstance(tensor, DTensor):
-                    state_dict[key].append(tensor._local_tensor.bfloat16())
+                    # Preserve FP32 adapter masters in exported LoRA checkpoints.
+                    local = tensor._local_tensor
+                    state_dict[key].append(local if "lora_" in key else local.bfloat16())
 
                     placements = tuple(tensor.placements)
                     # replicated placement at dp dimension can be discarded
@@ -202,7 +204,7 @@ class FSDPModelMerger(BaseModelMerger):
                     else:
                         assert param_placements[key] == placements
                 else:
-                    state_dict[key].append(tensor.bfloat16())
+                    state_dict[key].append(tensor if "lora_" in key else tensor.bfloat16())
 
         del model_state_dict_lst
 
